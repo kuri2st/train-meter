@@ -1,0 +1,16 @@
+{
+  "name": "train-meter",
+  "private": true,
+  "description": "train-meter の Android アプリ (Capacitor)。Web アプリ本体は docs/",
+  "scripts": {
+    "sync": "cap sync android",
+    "open": "cap open android"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.6.3",
+    "@capacitor/core": "8.6.3"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.6.3"
+  }
+}

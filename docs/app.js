@@ -5,6 +5,10 @@
  *     → onFix: 近くの線路 (パス) に当てはめ、パス上の位置 s [m] と進行方向 dir を決める
  *     → GPS が 3 秒以上来なければ tick で直前の速度のまま s を進める (推定)
  *     → render: 速度・グラフ・次駅・トンネル・路線図を描く
+ *
+ * Android アプリ (android/, Capacitor) の中では、GPS をネイティブのフォアグラウンドサービス
+ * (TrainLocationPlugin) から受け取るので、画面を消しても動き続け、通知に次駅を出す。
+ * ブラウザではバックグラウンドで位置が取れないので、戻ったときに測位からやり直す。
  */
 'use strict';
 
@@ -38,6 +42,12 @@ const SIM = params.get('sim');
 const SIM_X = Math.max(1, Number(params.get('x')) || 1);
 const t0Perf = performance.now(), t0Wall = Date.now();
 const now = () => t0Wall + (performance.now() - t0Perf) * (SIM ? SIM_X : 1);
+
+// ------------------------------------------------------------ Android アプリ (Capacitor) の中か
+const CAP = window.Capacitor;
+const NATIVE = !!(CAP && CAP.isNativePlatform && CAP.isNativePlatform() && CAP.Plugins && CAP.Plugins.TrainLocation);
+const TrainLocation = NATIVE ? CAP.Plugins.TrainLocation : null;
+const BG_GAP_MS = 10000;                // ブラウザでこれ以上バックグラウンドにいたら測位からやり直す
 
 // ------------------------------------------------------------ データ
 let LINES = [], PATHS = [];
@@ -134,6 +144,8 @@ const S = {
   estDecel: 0,                 // 推定中に続ける減速度 [m/s^2]
   slowSince: 0,                // 停止し始めた時刻
   stopSt: null,                // 停車中の駅 {pi, s, n}
+  afterGap: false,             // バックグラウンドから戻った直後 (次の測位で位置を取り直す)
+  hiddenAt: 0,
   acc: null,
   est: false,                  // 推定中か
   lastFixAt: 0, lastFix: null, lastTick: 0, lastMatchAt: 0,
@@ -204,7 +216,11 @@ function onFix(fix) {
   if (chosen) {
     const P = PATHS[chosen.pi];
     let s, dir = S.dir;
-    if (chosen.pi === S.pi) {
+    if (S.afterGap) {
+      // バックグラウンドから戻った: 位置は測位をそのまま使い、進行方向は同じパスなら引き継ぐ
+      s = chosen.s; S.sVar = Math.max(accuracy, 5) ** 2; S.anchorS = s;
+      if (chosen.pi !== S.pi) dir = 0;
+    } else if (chosen.pi === S.pi) {
       // パス上の位置を予測と測位の加重平均で滑らかにする (1 次元カルマンフィルタ)
       const pv = S.sVar + (3 * dtPrev) ** 2 + 4;
       const rv = Math.max(accuracy, 5) ** 2;
@@ -230,6 +246,7 @@ function onFix(fix) {
     }
     S.pi = chosen.pi; S.s = s; S.dir = dir;
     S.lastMatchAt = t;
+    S.afterGap = false;
   } else if (S.lastMatchAt && t - S.lastMatchAt > 30000) {
     S.pi = -1; S.dir = 0; S.alts = [];   // 線路から離れた
   }
@@ -239,6 +256,14 @@ function onFix(fix) {
   S.lastFix = { t, lat, lon };
   pushHist(t, v, false);
   updateStop(t);
+  if (NATIVE) updateNotification(t);
+}
+
+/** ブラウザでバックグラウンドから戻ったとき: 離れていた間の推定は当てにならないので測位からやり直す */
+function resetAfterGap() {
+  S.lastFixAt = 0; S.lastFix = null; S.est = false;
+  S.vRaw = []; S.stopSt = null; S.slowSince = 0;
+  S.afterGap = true;
 }
 
 /** 生の速度から外れ値を除く: 直近 3 点の中央値 → 前回からの変化を加減速度の上限で制限 */
@@ -298,6 +323,7 @@ function tick() {
   const dt = S.lastTick ? (t - S.lastTick) / 1000 : 0;
   S.lastTick = t;
   if (!S.running) return;
+  if (!NATIVE && document.hidden) return;   // ブラウザは裏で位置が来ないので推定もしない
   if (S.lastFixAt && t - S.lastFixAt > GPS_LOST_MS) {
     if (!S.est) S.estDecel = recentDecel();
     S.est = true;
@@ -452,6 +478,28 @@ function render() {
   drawStrip(ahead);
 }
 
+/** Android アプリの通知 (速度・次駅・到着予想) を更新する。2 秒に 1 回まで */
+let lastNotif = { t: 0, key: '' };
+function updateNotification(t) {
+  if (!NATIVE || !S.running || t - lastNotif.t < 2000) return;
+  const P = PATHS[S.pi];
+  const spd = S.lastFixAt || S.est ? `${Math.round(S.speed * 3.6)} km/h` : '測位待ち';
+  const title = `${spd}${S.est ? '（推定）' : ''}　${P ? lineLabel(P.line) : '線路の近くにいません'}`;
+  let text = '';
+  const ahead = P ? stationsAhead(2) : [];
+  const here = stationHere();
+  if (here) text += `${here.n} 停車中　`;
+  if (ahead.length) {
+    const e = etaSec(ahead[0].dist);
+    text += `次は ${ahead[0].n} ${fmtDist(ahead[0].dist)}` + (e == null ? '' : `（${fmtClock(t + e * 1000).slice(0, 5)} 着予想）`);
+    if (ahead[1]) text += `\nその次 ${ahead[1].n} ${fmtDist(ahead[1].dist)}`;
+  } else if (P) text += S.dir === 0 ? '進行方向を判定中' : '';
+  const key = title + text;
+  if (key === lastNotif.key) return;
+  lastNotif = { t, key };
+  TrainLocation.setNotification({ title, text }).catch(() => {});
+}
+
 function renderAlts(P) {
   const box = $('lineAlts');
   const want = S.alts.map((li) => `${li}:${li === S.pinnedLine}`).join(',');
@@ -563,14 +611,37 @@ async function requestWakeLock() {
   } catch (e) { console.warn('wake lock', e); }
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && S.running) requestWakeLock();
+  if (document.visibilityState === 'hidden') { S.hiddenAt = now(); return; }
+  if (!S.running) return;
+  if (!NATIVE) {
+    requestWakeLock();
+    if (!SIM && S.hiddenAt && now() - S.hiddenAt > BG_GAP_MS) resetAfterGap();
+  }
+  render();
 });
+
+let nativeSubs = [];
+async function startNative() {
+  const sub = (ev, fn) => TrainLocation.addListener(ev, fn).then((h) => nativeSubs.push(h));
+  await sub('location', (l) => onFix({
+    lat: l.lat, lon: l.lon, accuracy: l.accuracy, speed: l.speed, heading: l.heading,
+  }));
+  // 裏ではタイマーが間引かれるので、サービスからの 1 秒ごとの合図で推定と通知を進める
+  await sub('tick', () => { tick(); updateNotification(now()); });
+  try {
+    await TrainLocation.start();
+  } catch (e) {
+    stop();
+    $('status').textContent = '位置情報を開始できません: ' + (e.message || e);
+  }
+}
 
 function start() {
   S.running = true;
   $('startBtn').textContent = '停止';
+  if (SIM) { requestWakeLock(); startSim(SIM); return; }
+  if (NATIVE) { startNative(); return; }
   requestWakeLock();
-  if (SIM) { startSim(SIM); return; }
   if (!('geolocation' in navigator)) { alert('この端末では位置情報が使えません'); return; }
   watchId = navigator.geolocation.watchPosition(
     (pos) => onFix({
@@ -588,6 +659,11 @@ function stop() {
   if (watchId != null) navigator.geolocation.clearWatch(watchId);
   watchId = null;
   clearInterval(simTimer);
+  if (NATIVE) {
+    for (const h of nativeSubs) h.remove();
+    nativeSubs = [];
+    TrainLocation.stop().catch(() => {});
+  }
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 }
 
@@ -658,7 +734,7 @@ $('settingsBtn').onclick = openSettings;
     $('loading').textContent = '読み込み失敗: ' + e.message;
     return;
   }
-  setInterval(() => { tick(); render(); }, 250);
+  setInterval(() => { tick(); if (!document.hidden) render(); }, 250);
   render();
   const local = ['localhost', '127.0.0.1'].includes(location.hostname);
   if ('serviceWorker' in navigator && !local) navigator.serviceWorker.register('sw.js');

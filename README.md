@@ -9,6 +9,9 @@
 
 GPS が途切れた (トンネル内など) ときは、直前の速度のまま線路に沿って進んだと仮定して推定し、橙色で表示する。
 
+ブラウザ版はバックグラウンドでは位置が取れない (戻ったときに測位からやり直す)。
+画面を消しても動かしたいときは Android アプリ版 (`android/`) を使う。通知に速度・次駅・到着予想が出る。
+
 ## 構成
 
 | パス | 内容 |
@@ -18,11 +21,30 @@ GPS が途切れた (トンネル内など) ときは、直前の速度のまま
 | `tools/fetch_raw.py` | 元データの取得 (国土数値情報 N02-24、OSM の鉄道トンネル) |
 | `tools/build_data.py` | 元データを `rail.json` に加工 |
 | `raw/` | 元データ (git 管理外) |
+| `android/` | Android アプリ (Capacitor)。中身は `docs/` の Web アプリ |
+| `android/app/src/main/java/.../TrainLocationService.java` | GPS を取り続けるフォアグラウンドサービスと通知 |
+| `android/app/src/main/java/.../TrainLocationPlugin.java` | 上のサービスを JS (`app.js`) から使うためのプラグイン |
 
 ## データの作り直し
 
 Spyder で `tools/fetch_raw.py` → `tools/build_data.py` の順に実行する。
 アプリやデータを更新したら `docs/sw.js` の `VERSION` を上げる (端末のキャッシュを更新させるため)。
+
+## Android アプリのビルド
+
+Node.js と Android Studio が必要。リポジトリのルートで:
+
+```
+npm install
+npx cap sync android     # docs/ の中身をアプリにコピー (docs/ を変えたら毎回)
+npx cap open android     # Android Studio で開く (または android/ フォルダを直接開く)
+```
+
+Android Studio で端末をつないで ▶ (Run) を押す。初回の「開始」で位置情報と通知の許可を求められる。
+
+- 画面を消す・ほかのアプリに切り替えると、通知に「速度・路線 / 次駅・到着予想」が出て、そのまま測位を続ける
+- 「停止」を押すか、最近使ったアプリの一覧からスワイプで消すと止まる
+- 機種によっては省電力機能に止められる。そのときは端末の設定でこのアプリの「バッテリー」を「制限なし」にする
 
 ## 動作確認 (模擬走行)
 
