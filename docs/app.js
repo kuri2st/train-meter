@@ -1,0 +1,579 @@
+/* train-meter: 鉄道移動中の速度・路線・次駅・トンネル表示
+ *
+ * 位置の流れ
+ *   GPS (watchPosition) か模擬走行 (?sim=路線名)
+ *     → onFix: 近くの線路 (パス) に当てはめ、パス上の位置 s [m] と進行方向 dir を決める
+ *     → GPS が 3 秒以上来なければ tick で直前の速度のまま s を進める (推定)
+ *     → render: 速度・グラフ・次駅・トンネル・路線図を描く
+ */
+'use strict';
+
+const R_LAT = 110574, R_LON = 111320;   // 1 度あたりの距離 [m] (build_data.py と同じ)
+const CELL = 0.01;                      // 空間索引の格子 [度]
+const DECEL = 0.7;                      // 到着予想で使う減速度 [m/s^2]
+const GPS_LOST_MS = 3000;               // これ以上 GPS が来なければ推定に切り替え
+const ACC_LIMIT = 150;                  // これより精度が悪い測位は捨てる [m]
+const HIST_MAX_SEC = 1800;
+
+const DEFAULTS = { histSec: 180, tnInside: true, tnExit: true, tnNext: true, tnSection: true };
+const TN_KEYS = ['tnInside', 'tnExit', 'tnNext', 'tnSection'];
+
+const $ = (id) => document.getElementById(id);
+
+// ------------------------------------------------------------ 設定
+let settings = loadSettings();
+function loadSettings() {
+  try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('tm-settings') || '{}') }; }
+  catch { return { ...DEFAULTS }; }
+}
+function saveSettings() { localStorage.setItem('tm-settings', JSON.stringify(settings)); }
+
+// ------------------------------------------------------------ 時計 (模擬走行では早回し)
+const params = new URLSearchParams(location.search);
+const SIM = params.get('sim');
+const SIM_X = Math.max(1, Number(params.get('x')) || 1);
+const t0Perf = performance.now(), t0Wall = Date.now();
+const now = () => t0Wall + (performance.now() - t0Perf) * (SIM ? SIM_X : 1);
+
+// ------------------------------------------------------------ データ
+let LINES = [], PATHS = [];
+const GRID = new Map();
+const cellKey = (ix, iy) => ix * 100000 + iy;
+
+async function loadData() {
+  const res = await fetch('data/rail.json');
+  if (!res.ok) throw new Error('rail.json を読めませんでした: ' + res.status);
+  const js = await res.json();
+  LINES = js.lines;
+  $('attrib').textContent = '出典: ' + js.attribution;
+  const sc = js.scale;
+  PATHS = js.paths.map((p, pi) => {
+    const n = p.c.length / 2;
+    const lon = new Float64Array(n), lat = new Float64Array(n), cd = new Float64Array(n);
+    let x = 0, y = 0;
+    for (let i = 0; i < n; i++) {
+      x += p.c[2 * i]; y += p.c[2 * i + 1];
+      lon[i] = x / sc; lat[i] = y / sc;
+      if (i > 0) {
+        const cl = Math.cos((lat[i] + lat[i - 1]) / 2 * Math.PI / 180);
+        cd[i] = cd[i - 1] + Math.hypot((lon[i] - lon[i - 1]) * R_LON * cl, (lat[i] - lat[i - 1]) * R_LAT);
+      }
+    }
+    for (let k = 0; k < n - 1; k++) {
+      const ix0 = Math.floor(Math.min(lon[k], lon[k + 1]) / CELL), ix1 = Math.floor(Math.max(lon[k], lon[k + 1]) / CELL);
+      const iy0 = Math.floor(Math.min(lat[k], lat[k + 1]) / CELL), iy1 = Math.floor(Math.max(lat[k], lat[k + 1]) / CELL);
+      for (let ix = ix0; ix <= ix1; ix++) for (let iy = iy0; iy <= iy1; iy++) {
+        const key = cellKey(ix, iy);
+        let arr = GRID.get(key);
+        if (!arr) GRID.set(key, arr = []);
+        arr.push(pi * 1048576 + k);
+      }
+    }
+    return {
+      line: p.l, lon, lat, cd, len: cd[n - 1], loop: !!p.o,
+      st: p.s.map(([nm, s]) => ({ n: nm, s })),
+      tn: p.t.map(([a, b, nm]) => ({ a, b, n: nm || null })),
+    };
+  });
+}
+
+const lineLabel = (li) => `${LINES[li].c} ${LINES[li].n}`;
+
+/** 点の近くにあるパスを探し、パスごとに最も近い投影を返す */
+function candidates(lat, lon, radius) {
+  const cl = Math.cos(lat * Math.PI / 180);
+  const cx = Math.floor(lon / CELL), cy = Math.floor(lat / CELL);
+  const best = new Map();
+  for (let ix = cx - 1; ix <= cx + 1; ix++) for (let iy = cy - 1; iy <= cy + 1; iy++) {
+    const arr = GRID.get(cellKey(ix, iy));
+    if (!arr) continue;
+    for (const code of arr) {
+      const pi = Math.floor(code / 1048576), k = code % 1048576;
+      const P = PATHS[pi];
+      const ax = (P.lon[k] - lon) * R_LON * cl, ay = (P.lat[k] - lat) * R_LAT;
+      const bx = (P.lon[k + 1] - lon) * R_LON * cl, by = (P.lat[k + 1] - lat) * R_LAT;
+      const dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy;
+      let t = L2 > 0 ? -(ax * dx + ay * dy) / L2 : 0;
+      t = Math.max(0, Math.min(1, t));
+      const d = Math.hypot(ax + t * dx, ay + t * dy);
+      if (d > radius) continue;
+      const cur = best.get(pi);
+      if (!cur || d < cur.d) {
+        best.set(pi, {
+          pi, line: P.line, d,
+          s: P.cd[k] + t * (P.cd[k + 1] - P.cd[k]),
+          bearing: (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360,
+        });
+      }
+    }
+  }
+  return [...best.values()];
+}
+
+/** パス上の距離 s の経緯度 (模擬走行用) */
+function pointAt(P, s) {
+  const cd = P.cd;
+  let lo = 0, hi = cd.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cd[m] <= s) lo = m; else hi = m; }
+  const f = cd[hi] > cd[lo] ? (s - cd[lo]) / (cd[hi] - cd[lo]) : 0;
+  return { lat: P.lat[lo] + f * (P.lat[hi] - P.lat[lo]), lon: P.lon[lo] + f * (P.lon[hi] - P.lon[lo]) };
+}
+
+// ------------------------------------------------------------ 状態
+const S = {
+  running: false,
+  pi: -1, s: 0, dir: 0,        // パス, パス上の位置 [m], 進行方向 (+1 / -1 / 0=未定)
+  speed: 0,                    // [m/s]
+  acc: null,
+  est: false,                  // 推定中か
+  lastFixAt: 0, lastFix: null, lastTick: 0, lastMatchAt: 0,
+  alts: [],                    // 区別できない路線の候補 (line index)
+  pinnedLine: null, pinnedSeen: 0,
+  hist: [],                    // [{t, v, est}]
+};
+
+function angDiff(a, b) { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; }
+
+function onFix(fix) {
+  const t = now();
+  const { lat, lon, accuracy } = fix;
+  S.acc = accuracy;
+  if (accuracy > ACC_LIMIT) return;      // 精度が悪い (トンネル内の基地局測位など)
+
+  // 速度: GPS の値を優先、無ければ前回位置との差
+  let v = fix.speed;
+  if ((v == null || Number.isNaN(v)) && S.lastFix) {
+    const dt = (t - S.lastFix.t) / 1000;
+    if (dt > 0.5) {
+      const cl = Math.cos(lat * Math.PI / 180);
+      v = Math.hypot((lon - S.lastFix.lon) * R_LON * cl, (lat - S.lastFix.lat) * R_LAT) / dt;
+    }
+  }
+  if (v == null || Number.isNaN(v)) v = S.speed;
+  const dtPrev = S.lastFixAt ? (t - S.lastFixAt) / 1000 : 0;
+
+  const radius = Math.min(250, Math.max(40, accuracy * 2));
+  const cands = candidates(lat, lon, radius);
+  let chosen = null;
+  if (cands.length) {
+    const sig = Math.max(accuracy, 10);
+    const pred = S.s + S.dir * S.speed * dtPrev;
+    for (const c of cands) {
+      let cost = (c.d / sig) ** 2;
+      if (S.pi >= 0) {
+        if (c.pi === S.pi) cost += (Math.abs(c.s - pred) / 200) ** 2;
+        else cost += c.line === PATHS[S.pi].line ? 1 : 2.5;
+      }
+      if (v > 3 && fix.heading != null && !Number.isNaN(fix.heading)) {
+        const ad = Math.min(angDiff(fix.heading, c.bearing), angDiff(fix.heading, c.bearing + 180));
+        cost += (ad / 25) ** 2;
+      }
+      if (PATHS[c.pi].len < 2000) cost += 1.5;   // 駅構内の引込線などの短いパスは選びにくく
+      if (S.pinnedLine != null && c.line === S.pinnedLine) cost -= 4;
+      c.cost = cost;
+    }
+    cands.sort((a, b) => a.cost - b.cost);
+    chosen = cands[0];
+
+    // 区別できない路線 (候補が近く、評価も僅差) を手動選択用に並べる
+    const alts = [];
+    for (const c of cands) {
+      if (c.d > Math.max(accuracy, 30) + 25) continue;
+      if (S.pinnedLine == null && c.cost > chosen.cost + 3) continue;
+      if (!alts.includes(c.line)) alts.push(c.line);
+    }
+    S.alts = alts.length > 1 ? alts : [];
+    if (S.pinnedLine != null) {
+      if (cands.some((c) => c.line === S.pinnedLine)) S.pinnedSeen = t;
+      else if (t - S.pinnedSeen > 30000) S.pinnedLine = null;
+    }
+  }
+
+  if (chosen) {
+    // 進行方向: 動いていれば GPS の向き、無ければ同じパス上の移動量から
+    let dir = S.dir;
+    if (v > 2 && fix.heading != null && !Number.isNaN(fix.heading)) {
+      dir = Math.cos((fix.heading - chosen.bearing) * Math.PI / 180) >= 0 ? 1 : -1;
+    } else if (chosen.pi === S.pi && Math.abs(chosen.s - S.s) > 5) {
+      dir = Math.sign(chosen.s - S.s);
+    } else if (chosen.pi !== S.pi) {
+      dir = 0;
+    }
+    S.pi = chosen.pi; S.s = chosen.s; S.dir = dir;
+    S.lastMatchAt = t;
+  } else if (S.lastMatchAt && t - S.lastMatchAt > 30000) {
+    S.pi = -1; S.dir = 0; S.alts = [];   // 線路から離れた
+  }
+  S.speed = v;
+  S.est = false;
+  S.lastFixAt = t;
+  S.lastFix = { t, lat, lon };
+  pushHist(t, v, false);
+}
+
+/** GPS が途切れている間、直前の速度のまま線路上を進める */
+function tick() {
+  const t = now();
+  const dt = S.lastTick ? (t - S.lastTick) / 1000 : 0;
+  S.lastTick = t;
+  if (!S.running) return;
+  if (S.lastFixAt && t - S.lastFixAt > GPS_LOST_MS) {
+    S.est = true;
+    if (S.pi >= 0 && S.dir !== 0) {
+      const P = PATHS[S.pi];
+      S.s += S.dir * S.speed * dt;
+      if (P.loop) S.s = ((S.s % P.len) + P.len) % P.len;
+      else S.s = Math.max(0, Math.min(P.len, S.s));
+    }
+    const last = S.hist[S.hist.length - 1];
+    if (!last || t - last.t >= 1000) pushHist(t, S.speed, true);
+  }
+}
+
+function pushHist(t, v, est) {
+  S.hist.push({ t, v, est });
+  while (S.hist.length && S.hist[0].t < t - HIST_MAX_SEC * 1000) S.hist.shift();
+}
+
+// ------------------------------------------------------------ 計算
+/** 進行方向の先にある駅 [{n, dist}] */
+function stationsAhead(n) {
+  const P = PATHS[S.pi];
+  if (!P || S.dir === 0) return [];
+  const out = [];
+  const list = S.dir > 0 ? P.st : [...P.st].reverse();
+  for (const st of list) {
+    const d = (st.s - S.s) * S.dir;
+    if (d > 30) out.push({ n: st.n, dist: d });
+    if (out.length >= n) return out;
+  }
+  if (P.loop) {   // 環状線は一周して続ける
+    for (const st of list) {
+      const d = (st.s - S.s) * S.dir + P.len;
+      if (d > 30 && out.length < n) out.push({ n: st.n, dist: d });
+    }
+  }
+  return out;
+}
+
+function stationHere() {
+  const P = PATHS[S.pi];
+  if (!P) return null;
+  return P.st.find((st) => Math.abs(st.s - S.s) <= 120) || null;
+}
+
+/** 巡航速度: 現在速度と直近 60 秒の走行中平均の大きい方 */
+function cruiseSpeed() {
+  const t = now();
+  const vs = S.hist.filter((h) => h.t > t - 60000 && h.v > 1).map((h) => h.v);
+  const avg = vs.length ? vs.reduce((a, b) => a + b, 0) / vs.length : 0;
+  return Math.max(S.speed, avg);
+}
+
+/** 距離 D [m] を巡航→一定減速で停止するとしたときの所要時間 [s] */
+function etaSec(D) {
+  const v = cruiseSpeed();
+  if (v < 1) return null;
+  const brake = v * v / (2 * DECEL);
+  return D > brake ? (D - brake) / v + v / DECEL : Math.sqrt(2 * D / DECEL);
+}
+
+function tunnelInfo(nextDist) {
+  const P = PATHS[S.pi];
+  if (!P || S.dir === 0) return null;
+  const s = S.s, dir = S.dir;
+  const inside = P.tn.find((tn) => s >= tn.a && s <= tn.b) || null;
+  let next = null;
+  for (const tn of P.tn) {
+    const d = dir > 0 ? tn.a - s : s - tn.b;
+    if (d > 0 && (!next || d < next.dist)) next = { tn, dist: d };
+  }
+  let count = 0, total = 0;
+  if (nextDist != null) {
+    const lo = dir > 0 ? s : s - nextDist, hi = dir > 0 ? s + nextDist : s;
+    for (const tn of P.tn) {
+      const ov = Math.min(hi, tn.b) - Math.max(lo, tn.a);
+      if (ov > 0) { count++; total += ov; }
+    }
+  }
+  return {
+    inside, exit: inside ? (dir > 0 ? inside.b - s : s - inside.a) : null,
+    next, count, total,
+  };
+}
+
+// ------------------------------------------------------------ 表示
+const fmtDist = (m) => m >= 1000 ? (m / 1000).toFixed(m >= 10000 ? 1 : 2) + ' km' : Math.round(m) + ' m';
+const fmtClock = (ms) => new Date(ms).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const fmtDur = (s) => s >= 3600 ? `${Math.floor(s / 3600)}時間${Math.round(s % 3600 / 60)}分`
+  : `${Math.floor(s / 60)}分${String(Math.round(s % 60)).padStart(2, '0')}秒`;
+
+function render() {
+  const t = now();
+  // 速度
+  const speedSec = $('speed').parentElement.parentElement;
+  speedSec.classList.toggle('est', S.est);
+  $('speed').textContent = S.running && (S.lastFixAt || S.est) ? Math.round(S.speed * 3.6) : '--';
+  let status;
+  if (!S.running) status = '停止中';
+  else if (!S.lastFixAt) status = '測位待ち…';
+  else if (S.est) status = `GPS 途切れ ${Math.round((t - S.lastFixAt) / 1000)} 秒 — 直前の速度で推定中`;
+  else status = `GPS 精度 ±${Math.round(S.acc)} m` + (SIM ? `（模擬走行 ×${SIM_X}）` : '');
+  $('status').textContent = status;
+
+  // 路線
+  const P = PATHS[S.pi];
+  $('lineName').textContent = P ? lineLabel(P.line) : (S.running ? '線路の近くにいません' : '路線未判定');
+  renderAlts(P);
+
+  // 次駅
+  const ahead = stationsAhead(4);
+  const here = stationHere();
+  $('dirLabel').textContent = !P ? '' : S.dir === 0 ? '進行方向を判定中' :
+    (here && S.speed < 2 ? `${here.n} 停車中` : '');
+  const estCls = S.est ? 'est-val' : '';
+  if (ahead.length) {
+    const nx = ahead[0];
+    $('nextName').textContent = nx.n;
+    $('nextDist').textContent = fmtDist(nx.dist);
+    $('nextDist').className = 'big ' + estCls;
+    const e = etaSec(nx.dist);
+    $('nextEta').textContent = e == null ? '--' : `${fmtClock(t + e * 1000)}（${fmtDur(e)}）`;
+  } else {
+    $('nextName').textContent = '--';
+    $('nextDist').textContent = '--';
+    $('nextEta').textContent = '--';
+  }
+  $('following').innerHTML = ahead.slice(1).map((a) => {
+    const e = etaSec(a.dist);
+    return `<li><span>${esc(a.n)}</span><span>${fmtDist(a.dist)}　${e == null ? '--' : fmtClock(t + e * 1000)}</span></li>`;
+  }).join('');
+
+  // トンネル
+  const ti = tunnelInfo(ahead.length ? ahead[0].dist : null);
+  for (const k of TN_KEYS) $(k).parentElement.classList.toggle('hide', !settings[k]);
+  $('tunnelCard').style.display = TN_KEYS.some((k) => settings[k]) ? '' : 'none';
+  if (ti) {
+    $('tnInside').textContent = ti.inside
+      ? `トンネル内: ${ti.inside.n || '名称不明'}（全長 ${fmtDist(ti.inside.b - ti.inside.a)}）` : '地上';
+    $('tnExit').textContent = ti.exit != null ? fmtDist(ti.exit) : '--';
+    $('tnNext').textContent = ti.next
+      ? `${fmtDist(ti.next.dist)} 先 ${ti.next.tn.n || ''}（${fmtDist(ti.next.tn.b - ti.next.tn.a)}）` : 'なし';
+    $('tnSection').textContent = ahead.length ? `${ti.count} 本・計 ${fmtDist(ti.total)}` : '--';
+  } else {
+    for (const k of TN_KEYS) $(k).textContent = '--';
+  }
+
+  drawChart(t);
+  drawStrip(ahead);
+}
+
+function renderAlts(P) {
+  const box = $('lineAlts');
+  const want = S.alts.map((li) => `${li}:${li === S.pinnedLine}`).join(',');
+  if (box.dataset.k === want) return;
+  box.dataset.k = want;
+  box.innerHTML = '';
+  for (const li of S.alts) {
+    const b = document.createElement('button');
+    b.textContent = lineLabel(li);
+    if (li === S.pinnedLine || (S.pinnedLine == null && P && P.line === li)) b.classList.add('on');
+    b.onclick = () => { S.pinnedLine = li; S.pinnedSeen = now(); box.dataset.k = ''; };
+    box.appendChild(b);
+  }
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+function setupCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { ctx, w, h };
+}
+
+function drawChart(t) {
+  const sec = settings.histSec;
+  $('histLabel').textContent = `過去 ${sec} 秒`;
+  const { ctx, w, h } = setupCanvas($('chart'));
+  const L = 34, R = 6, T = 6, B = 18;
+  const pts = S.hist.filter((p) => p.t >= t - sec * 1000);
+  const vmax = Math.max(40, Math.ceil(Math.max(0, ...pts.map((p) => p.v * 3.6)) * 1.1 / 20) * 20);
+  const X = (tt) => L + (w - L - R) * (1 - (t - tt) / (sec * 1000));
+  const Y = (kmh) => T + (h - T - B) * (1 - kmh / vmax);
+  ctx.font = '11px system-ui'; ctx.fillStyle = '#8b97a3'; ctx.strokeStyle = '#2a323a'; ctx.lineWidth = 1;
+  const step = vmax <= 80 ? 20 : vmax <= 200 ? 40 : 100;
+  for (let k = 0; k <= vmax; k += step) {
+    ctx.beginPath(); ctx.moveTo(L, Y(k)); ctx.lineTo(w - R, Y(k)); ctx.stroke();
+    ctx.textAlign = 'right'; ctx.fillText(k, L - 4, Y(k) + 4);
+  }
+  ctx.textAlign = 'center';
+  for (const frac of [0, 0.5, 1]) {
+    const lab = frac === 1 ? '現在' : `-${Math.round(sec * (1 - frac))}s`;
+    ctx.fillText(lab, L + (w - L - R) * frac, h - 4);
+  }
+  ctx.lineWidth = 2;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    if (b.t - a.t > 30000) continue;   // 長い空白はつながない
+    ctx.strokeStyle = b.est ? '#ffb74d' : '#4fc3f7';
+    ctx.setLineDash(b.est ? [4, 3] : []);
+    ctx.beginPath(); ctx.moveTo(X(a.t), Y(a.v * 3.6)); ctx.lineTo(X(b.t), Y(b.v * 3.6)); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+}
+
+/** 進行方向を右にした直線の路線図 (駅・トンネル・現在位置) */
+function drawStrip(ahead) {
+  const { ctx, w, h } = setupCanvas($('strip'));
+  const P = PATHS[S.pi];
+  if (!P || S.dir === 0) {
+    ctx.fillStyle = '#8b97a3'; ctx.font = '13px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText('路線と進行方向が決まると表示します', w / 2, h / 2);
+    return;
+  }
+  const span = Math.min(60000, Math.max(2000, ahead.length ? ahead[Math.min(2, ahead.length - 1)].dist * 1.1 : 3000));
+  const behind = span * 0.18;
+  const pad = 14, y = 40;
+  const X = (s) => pad + (w - 2 * pad) * (((s - S.s) * S.dir + behind) / (span + behind));
+  const inView = (s) => { const d = (s - S.s) * S.dir; return d >= -behind && d <= span; };
+  ctx.strokeStyle = '#5b6875'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(w - pad, y); ctx.stroke();
+  // トンネル
+  ctx.strokeStyle = '#a1887f'; ctx.lineWidth = 10;
+  for (const tn of P.tn) {
+    const xa = X(tn.a), xb = X(tn.b);
+    const x0 = Math.max(pad, Math.min(xa, xb)), x1 = Math.min(w - pad, Math.max(xa, xb));
+    if (x1 > x0) { ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke(); }
+  }
+  // 駅
+  ctx.font = '11px system-ui'; ctx.textAlign = 'center';
+  let lastX = -1e9, row = 0;
+  const sts = P.st.filter((st) => inView(st.s)).sort((a, b) => X(a.s) - X(b.s));
+  for (const st of sts) {
+    const x = X(st.s);
+    ctx.fillStyle = '#e8edf2'; ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
+    row = x - lastX < 70 ? 1 - row : 0;
+    lastX = x;
+    ctx.fillText(st.n, x, row ? y + 36 : y + 22);
+  }
+  // 現在位置
+  const cx = X(S.s);
+  ctx.fillStyle = S.est ? '#ffb74d' : '#4fc3f7';
+  ctx.beginPath(); ctx.moveTo(cx - 7, y - 20); ctx.lineTo(cx + 7, y - 20); ctx.lineTo(cx, y - 8); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#8b97a3'; ctx.textAlign = 'right';
+  ctx.fillText(`→ ${fmtDist(span)} 先まで`, w - pad, 12);
+}
+
+// ------------------------------------------------------------ 位置の取得
+let watchId = null, simTimer = null, wakeLock = null;
+
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) { console.warn('wake lock', e); }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && S.running) requestWakeLock();
+});
+
+function start() {
+  S.running = true;
+  $('startBtn').textContent = '停止';
+  requestWakeLock();
+  if (SIM) { startSim(SIM); return; }
+  if (!('geolocation' in navigator)) { alert('この端末では位置情報が使えません'); return; }
+  watchId = navigator.geolocation.watchPosition(
+    (pos) => onFix({
+      lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy,
+      speed: pos.coords.speed, heading: pos.coords.heading,
+    }),
+    (err) => { $('status').textContent = '位置情報エラー: ' + err.message; },
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 },
+  );
+}
+
+function stop() {
+  S.running = false;
+  $('startBtn').textContent = '開始';
+  if (watchId != null) navigator.geolocation.clearWatch(watchId);
+  watchId = null;
+  clearInterval(simTimer);
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+
+/** 模擬走行: ?sim=路線名の一部 [&x=早回し倍率] [&v=最高速度km/h]
+ *  各駅に停車し、トンネル内では GPS を出さない (推定の動作確認用) */
+function startSim(q) {
+  let best = null;
+  PATHS.forEach((P, pi) => {
+    const nm = lineLabel(P.line);
+    if (nm.includes(q) && P.st.length >= 2 && (!best || P.len > PATHS[best].len)) best = pi;
+  });
+  if (best == null) { alert(`模擬走行: 「${q}」を含む路線が見つかりません`); return; }
+  const P = PATHS[best];
+  const vmax = (Number(params.get('v')) || (lineLabel(P.line).includes('新幹線') ? 270 : 100)) / 3.6;
+  const sim = { s: P.st[0].s, v: 0, dwell: 15, idx: 1 };
+  const dt = 1;   // 模擬時間で 1 秒ごと
+  simTimer = setInterval(() => {
+    const target = P.st[sim.idx];
+    if (!target) { stop(); return; }
+    if (sim.dwell > 0) { sim.dwell -= dt; }
+    else {
+      const D = target.s - sim.s;
+      if (sim.v * sim.v / (2 * DECEL) >= D - sim.v * dt) sim.v = Math.max(0.5, sim.v - DECEL * dt);
+      else sim.v = Math.min(vmax, sim.v + 0.8 * dt);
+      sim.s += sim.v * dt;
+      if (sim.s >= target.s) { sim.s = target.s; sim.v = 0; sim.dwell = 20; sim.idx++; }
+    }
+    const inTunnel = P.tn.some((tn) => sim.s >= tn.a && sim.s <= tn.b);
+    if (inTunnel) return;
+    const p = pointAt(P, sim.s);
+    const p2 = pointAt(P, Math.min(P.len, sim.s + 5));
+    const cl = Math.cos(p.lat * Math.PI / 180);
+    const heading = (Math.atan2((p2.lon - p.lon) * cl * R_LON, (p2.lat - p.lat) * R_LAT) * 180 / Math.PI + 360) % 360;
+    const noise = () => (Math.random() - 0.5) * 8 / R_LAT;
+    onFix({
+      lat: p.lat + noise(), lon: p.lon + noise(), accuracy: 6 + Math.random() * 6,
+      speed: Math.max(0, sim.v + (Math.random() - 0.5) * 0.5), heading: sim.v > 1 ? heading : null,
+    });
+  }, 1000 / SIM_X);
+}
+
+// ------------------------------------------------------------ 設定画面
+function openSettings() {
+  $('setHist').value = settings.histSec;
+  for (const k of TN_KEYS) $('set_' + k).checked = settings[k];
+  $('settings').showModal();
+}
+$('settings').addEventListener('close', () => {
+  if ($('settings').returnValue !== 'save') return;
+  const h = Math.round(Number($('setHist').value));
+  settings.histSec = Math.min(1800, Math.max(30, Number.isFinite(h) ? h : DEFAULTS.histSec));
+  for (const k of TN_KEYS) settings[k] = $('set_' + k).checked;
+  saveSettings();
+  render();
+});
+
+// ------------------------------------------------------------ 起動
+$('startBtn').onclick = () => (S.running ? stop() : start());
+$('settingsBtn').onclick = openSettings;
+
+(async () => {
+  try {
+    await loadData();
+    $('loading').classList.add('hide');
+  } catch (e) {
+    $('loading').textContent = '読み込み失敗: ' + e.message;
+    return;
+  }
+  setInterval(() => { tick(); render(); }, 250);
+  render();
+  const local = ['localhost', '127.0.0.1'].includes(location.hostname);
+  if ('serviceWorker' in navigator && !local) navigator.serviceWorker.register('sw.js');
+})();

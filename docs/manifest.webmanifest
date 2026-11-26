@@ -1,0 +1,13 @@
+{
+  "name": "train-meter",
+  "short_name": "train-meter",
+  "description": "鉄道移動中の速度・路線・次駅・トンネル表示",
+  "start_url": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#101418",
+  "theme_color": "#101418",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
