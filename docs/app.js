@@ -140,6 +140,7 @@ const S = {
   speed: 0,                    // [m/s] (外れ値除去・加減速制限後)
   sVar: 0,                     // s の推定分散 [m^2]
   anchorS: 0,                  // 進行方向を移動量から決めるときの基準位置
+  fixes: [],                   // 直近 6 秒の測位 (速度の食い違い確認用)
   vRaw: [],                    // 直近の生の速度 (中央値フィルタ用)
   estDecel: 0,                 // 推定中に続ける減速度 [m/s^2]
   slowSince: 0,                // 停止し始めた時刻
@@ -172,6 +173,16 @@ function onFix(fix) {
     }
   }
   if (v == null || Number.isNaN(v)) v = S.speed;
+  // GPS が走行中に 0 付近を返すことがあるので、直近数秒の移動距離と食い違えば移動距離の方を使う
+  S.fixes.push({ t, lat, lon, acc: accuracy });
+  while (S.fixes.length && S.fixes[0].t < t - 6000) S.fixes.shift();
+  const f0 = S.fixes[0];
+  if (f0 && t - f0.t >= 2500) {
+    const cl = Math.cos(lat * Math.PI / 180);
+    const dist = Math.hypot((lon - f0.lon) * R_LON * cl, (lat - f0.lat) * R_LAT);
+    const vPos = dist / ((t - f0.t) / 1000);
+    if (dist > 2 * (accuracy + f0.acc) && vPos > 4 && v < vPos * 0.5) v = vPos;
+  }
   const dtPrev = S.lastFixAt ? (t - S.lastFixAt) / 1000 : 0;
   v = filterSpeed(v, dtPrev);
   // 予測位置 (推定中は tick が既に進めている)
@@ -262,7 +273,7 @@ function onFix(fix) {
 /** ブラウザでバックグラウンドから戻ったとき: 離れていた間の推定は当てにならないので測位からやり直す */
 function resetAfterGap() {
   S.lastFixAt = 0; S.lastFix = null; S.est = false;
-  S.vRaw = []; S.stopSt = null; S.slowSince = 0;
+  S.vRaw = []; S.fixes = []; S.stopSt = null; S.slowSince = 0;
   S.afterGap = true;
 }
 
@@ -700,9 +711,11 @@ function startSim(q) {
     const heading = (Math.atan2((p2.lon - p.lon) * cl * R_LON, (p2.lat - p.lat) * R_LAT) * 180 / Math.PI + 360) % 360;
     const noise = () => (Math.random() - 0.5) * 2 * SIM_NOISE / R_LAT;
     const spike = SIM_NOISE > 4 && Math.random() < 0.05 ? Math.random() * 15 : 0;   // 時々出る速度の外れ値
+    if (SIM_NOISE > 4 && !sim.drop && Math.random() < 0.02) sim.drop = 2 + Math.floor(Math.random() * 4);
+    const drop = sim.drop > 0 && sim.drop--;   // 走行中に数秒間 0 を返す
     onFix({
       lat: p.lat + noise(), lon: p.lon + noise(), accuracy: SIM_NOISE * 1.5 + Math.random() * 6,
-      speed: Math.max(0, sim.v + (Math.random() - 0.5) * 0.5 + spike), heading: sim.v > 1 ? heading : null,
+      speed: drop ? 0 : Math.max(0, sim.v + (Math.random() - 0.5) * 0.5 + spike), heading: sim.v > 1 ? heading : null,
     });
   }, 1000 / SIM_X);
 }
