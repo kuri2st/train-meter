@@ -13,6 +13,10 @@ const CELL = 0.01;                      // 空間索引の格子 [度]
 const DECEL = 0.7;                      // 到着予想で使う減速度 [m/s^2]
 const GPS_LOST_MS = 3000;               // これ以上 GPS が来なければ推定に切り替え
 const ACC_LIMIT = 150;                  // これより精度が悪い測位は捨てる [m]
+const A_MAX = 1.5;                      // 速度の変化として許す加減速度 [m/s^2] (列車は通常 1 前後)
+const STOP_V = 1.5;                     // これ未満を停止とみなす [m/s]
+const STOP_HOLD_MS = 3000;              // この時間停止が続いたら駅に着いたとみなす
+const STOP_RADIUS = 150;                // 駅とみなす距離 [m] (+ GPS 精度、最大 +100)
 const HIST_MAX_SEC = 1800;
 
 const DEFAULTS = { histSec: 180, tnInside: true, tnExit: true, tnNext: true, tnSection: true };
@@ -123,7 +127,13 @@ function pointAt(P, s) {
 const S = {
   running: false,
   pi: -1, s: 0, dir: 0,        // パス, パス上の位置 [m], 進行方向 (+1 / -1 / 0=未定)
-  speed: 0,                    // [m/s]
+  speed: 0,                    // [m/s] (外れ値除去・加減速制限後)
+  sVar: 0,                     // s の推定分散 [m^2]
+  anchorS: 0,                  // 進行方向を移動量から決めるときの基準位置
+  vRaw: [],                    // 直近の生の速度 (中央値フィルタ用)
+  estDecel: 0,                 // 推定中に続ける減速度 [m/s^2]
+  slowSince: 0,                // 停止し始めた時刻
+  stopSt: null,                // 停車中の駅 {pi, s, n}
   acc: null,
   est: false,                  // 推定中か
   lastFixAt: 0, lastFix: null, lastTick: 0, lastMatchAt: 0,
@@ -151,13 +161,15 @@ function onFix(fix) {
   }
   if (v == null || Number.isNaN(v)) v = S.speed;
   const dtPrev = S.lastFixAt ? (t - S.lastFixAt) / 1000 : 0;
+  v = filterSpeed(v, dtPrev);
+  // 予測位置 (推定中は tick が既に進めている)
+  const pred = S.est ? S.s : S.s + S.dir * S.speed * dtPrev;
 
   const radius = Math.min(250, Math.max(40, accuracy * 2));
   const cands = candidates(lat, lon, radius);
   let chosen = null;
   if (cands.length) {
     const sig = Math.max(accuracy, 10);
-    const pred = S.s + S.dir * S.speed * dtPrev;
     for (const c of cands) {
       let cost = (c.d / sig) ** 2;
       if (S.pi >= 0) {
@@ -190,16 +202,33 @@ function onFix(fix) {
   }
 
   if (chosen) {
-    // 進行方向: 動いていれば GPS の向き、無ければ同じパス上の移動量から
-    let dir = S.dir;
-    if (v > 2 && fix.heading != null && !Number.isNaN(fix.heading)) {
-      dir = Math.cos((fix.heading - chosen.bearing) * Math.PI / 180) >= 0 ? 1 : -1;
-    } else if (chosen.pi === S.pi && Math.abs(chosen.s - S.s) > 5) {
-      dir = Math.sign(chosen.s - S.s);
-    } else if (chosen.pi !== S.pi) {
-      dir = 0;
+    const P = PATHS[chosen.pi];
+    let s, dir = S.dir;
+    if (chosen.pi === S.pi) {
+      // パス上の位置を予測と測位の加重平均で滑らかにする (1 次元カルマンフィルタ)
+      const pv = S.sVar + (3 * dtPrev) ** 2 + 4;
+      const rv = Math.max(accuracy, 5) ** 2;
+      const innov = ringDiff(P, chosen.s, pred);
+      if (Math.abs(innov) > 300) { s = chosen.s; S.sVar = rv; }
+      else {
+        const k = pv / (pv + rv);
+        s = wrapS(P, pred + k * innov);
+        S.sVar = (1 - k) * pv;
+      }
+    } else {
+      s = chosen.s; S.sVar = Math.max(accuracy, 5) ** 2;
+      dir = 0; S.anchorS = s; S.stopSt = null;
     }
-    S.pi = chosen.pi; S.s = chosen.s; S.dir = dir;
+    // 進行方向: 走行中なら GPS の向き、向きが無ければ一定距離動いた向き。停止中は変えない
+    if (v <= 1) S.anchorS = s;
+    else if (v > 2 && fix.heading != null && !Number.isNaN(fix.heading)) {
+      dir = Math.cos((fix.heading - chosen.bearing) * Math.PI / 180) >= 0 ? 1 : -1;
+      S.anchorS = s;
+    } else {
+      const ds = ringDiff(P, s, S.anchorS);
+      if (Math.abs(ds) > 25) { dir = Math.sign(ds); S.anchorS = s; }
+    }
+    S.pi = chosen.pi; S.s = s; S.dir = dir;
     S.lastMatchAt = t;
   } else if (S.lastMatchAt && t - S.lastMatchAt > 30000) {
     S.pi = -1; S.dir = 0; S.alts = [];   // 線路から離れた
@@ -209,6 +238,58 @@ function onFix(fix) {
   S.lastFixAt = t;
   S.lastFix = { t, lat, lon };
   pushHist(t, v, false);
+  updateStop(t);
+}
+
+/** 生の速度から外れ値を除く: 直近 3 点の中央値 → 前回からの変化を加減速度の上限で制限 */
+function filterSpeed(raw, dt) {
+  raw = Math.max(0, raw);
+  S.vRaw.push(raw);
+  if (S.vRaw.length > 3) S.vRaw.shift();
+  if (dt > 10) S.vRaw = [raw];               // 長く途切れた後は過去を使わない
+  const med = [...S.vRaw].sort((a, b) => a - b)[Math.floor(S.vRaw.length / 2)];
+  if (S.est || !S.lastFixAt || dt > 10) return med;   // 推定中の速度は当てにならないので制限しない
+  const lim = A_MAX * dt + 0.5;
+  const v = Math.max(S.speed - lim, Math.min(S.speed + lim, med));
+  return v < 0.3 ? 0 : v;
+}
+
+/** パス上の 2 点の差 a - b (環状線は近い向きで) */
+function ringDiff(P, a, b) {
+  let d = a - b;
+  if (P.loop) { d = ((d % P.len) + P.len) % P.len; if (d > P.len / 2) d -= P.len; }
+  return d;
+}
+function wrapS(P, s) {
+  return P.loop ? ((s % P.len) + P.len) % P.len : Math.max(0, Math.min(P.len, s));
+}
+
+/** 駅の近くで一定時間止まったら、その駅に着いたとみなす (次駅の表示をその先の駅にする) */
+function updateStop(t) {
+  const P = PATHS[S.pi];
+  if (!P) { S.stopSt = null; return; }
+  const radius = STOP_RADIUS + Math.min(S.acc || 0, 100);
+  if (S.stopSt && (S.stopSt.pi !== S.pi || Math.abs(ringDiff(P, S.stopSt.s, S.s)) > radius + 200)) S.stopSt = null;
+  if (S.speed >= STOP_V) { S.slowSince = 0; return; }
+  if (!S.slowSince) S.slowSince = t;
+  if (t - S.slowSince < STOP_HOLD_MS) return;
+  let best = null, bd = Infinity;
+  for (const st of P.st) {
+    const d = Math.abs(ringDiff(P, st.s, S.s));
+    if (d <= radius && d < bd) { best = st; bd = d; }
+  }
+  if (best) S.stopSt = { pi: S.pi, s: best.s, n: best.n };
+}
+
+/** 推定に入るとき、直前に減速していたらその減速を続ける (駅に止まる途中で GPS が途切れた場合) */
+function recentDecel() {
+  const pts = S.hist.filter((h) => !h.est && h.t >= S.lastFixAt - 8000);
+  if (pts.length < 3) return 0;
+  const mt = pts.reduce((a, h) => a + h.t, 0) / pts.length, mv = pts.reduce((a, h) => a + h.v, 0) / pts.length;
+  let num = 0, den = 0;
+  for (const h of pts) { num += (h.t - mt) / 1000 * (h.v - mv); den += ((h.t - mt) / 1000) ** 2; }
+  const slope = den > 0 ? num / den : 0;
+  return slope < -0.15 ? Math.min(-slope, 1.2) : 0;
 }
 
 /** GPS が途切れている間、直前の速度のまま線路上を進める */
@@ -218,15 +299,17 @@ function tick() {
   S.lastTick = t;
   if (!S.running) return;
   if (S.lastFixAt && t - S.lastFixAt > GPS_LOST_MS) {
+    if (!S.est) S.estDecel = recentDecel();
     S.est = true;
+    if (S.estDecel) S.speed = Math.max(0, S.speed - S.estDecel * dt);
     if (S.pi >= 0 && S.dir !== 0) {
       const P = PATHS[S.pi];
-      S.s += S.dir * S.speed * dt;
-      if (P.loop) S.s = ((S.s % P.len) + P.len) % P.len;
-      else S.s = Math.max(0, Math.min(P.len, S.s));
+      S.s = wrapS(P, S.s + S.dir * S.speed * dt);
     }
+    S.sVar += (3 * dt) ** 2;
     const last = S.hist[S.hist.length - 1];
     if (!last || t - last.t >= 1000) pushHist(t, S.speed, true);
+    updateStop(t);
   }
 }
 
@@ -242,30 +325,30 @@ function stationsAhead(n) {
   if (!P || S.dir === 0) return [];
   const out = [];
   const list = S.dir > 0 ? P.st : [...P.st].reverse();
+  const stop = S.stopSt && S.stopSt.pi === S.pi ? S.stopSt.s : null;
   for (const st of list) {
     const d = (st.s - S.s) * S.dir;
-    if (d > 30) out.push({ n: st.n, dist: d });
+    if (d > 0 && st.s !== stop) out.push({ n: st.n, dist: d });
     if (out.length >= n) return out;
   }
   if (P.loop) {   // 環状線は一周して続ける
     for (const st of list) {
       const d = (st.s - S.s) * S.dir + P.len;
-      if (d > 30 && out.length < n) out.push({ n: st.n, dist: d });
+      if (d > 0 && st.s !== stop && out.length < n) out.push({ n: st.n, dist: d });
     }
   }
   return out;
 }
 
+/** 停車中の駅 (updateStop で着いたと判定した駅) */
 function stationHere() {
-  const P = PATHS[S.pi];
-  if (!P) return null;
-  return P.st.find((st) => Math.abs(st.s - S.s) <= 120) || null;
+  return S.stopSt && S.stopSt.pi === S.pi ? S.stopSt : null;
 }
 
-/** 巡航速度: 現在速度と直近 60 秒の走行中平均の大きい方 */
+/** 巡航速度: 現在速度と直近 5 分の走行中平均の大きい方 */
 function cruiseSpeed() {
   const t = now();
-  const vs = S.hist.filter((h) => h.t > t - 60000 && h.v > 1).map((h) => h.v);
+  const vs = S.hist.filter((h) => h.t > t - 300000 && h.v > 3).map((h) => h.v);
   const avg = vs.length ? vs.reduce((a, b) => a + b, 0) / vs.length : 0;
   return Math.max(S.speed, avg);
 }
@@ -275,7 +358,8 @@ function etaSec(D) {
   const v = cruiseSpeed();
   if (v < 1) return null;
   const brake = v * v / (2 * DECEL);
-  return D > brake ? (D - brake) / v + v / DECEL : Math.sqrt(2 * D / DECEL);
+  const start = S.speed < STOP_V ? v / (2 * DECEL) : 0;   // 停車中は加速にかかる分を足す
+  return (D > brake ? (D - brake) / v + v / DECEL : Math.sqrt(2 * D / DECEL)) + start;
 }
 
 function tunnelInfo(nextDist) {
@@ -518,6 +602,7 @@ function startSim(q) {
   if (best == null) { alert(`模擬走行: 「${q}」を含む路線が見つかりません`); return; }
   const P = PATHS[best];
   const vmax = (Number(params.get('v')) || (lineLabel(P.line).includes('新幹線') ? 270 : 100)) / 3.6;
+  const SIM_NOISE = Number(params.get('n')) || 4;   // 位置の誤差 [m]
   const sim = { s: P.st[0].s, v: 0, dwell: 15, idx: 1 };
   const dt = 1;   // 模擬時間で 1 秒ごと
   simTimer = setInterval(() => {
@@ -537,10 +622,11 @@ function startSim(q) {
     const p2 = pointAt(P, Math.min(P.len, sim.s + 5));
     const cl = Math.cos(p.lat * Math.PI / 180);
     const heading = (Math.atan2((p2.lon - p.lon) * cl * R_LON, (p2.lat - p.lat) * R_LAT) * 180 / Math.PI + 360) % 360;
-    const noise = () => (Math.random() - 0.5) * 8 / R_LAT;
+    const noise = () => (Math.random() - 0.5) * 2 * SIM_NOISE / R_LAT;
+    const spike = SIM_NOISE > 4 && Math.random() < 0.05 ? Math.random() * 15 : 0;   // 時々出る速度の外れ値
     onFix({
-      lat: p.lat + noise(), lon: p.lon + noise(), accuracy: 6 + Math.random() * 6,
-      speed: Math.max(0, sim.v + (Math.random() - 0.5) * 0.5), heading: sim.v > 1 ? heading : null,
+      lat: p.lat + noise(), lon: p.lon + noise(), accuracy: SIM_NOISE * 1.5 + Math.random() * 6,
+      speed: Math.max(0, sim.v + (Math.random() - 0.5) * 0.5 + spike), heading: sim.v > 1 ? heading : null,
     });
   }, 1000 / SIM_X);
 }
