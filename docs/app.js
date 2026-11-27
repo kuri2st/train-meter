@@ -55,7 +55,21 @@ const BG_GAP_MS = 10000;                // ブラウザでこれ以上バック�
 
 // ------------------------------------------------------------ データ
 let LINES = [], PATHS = [];
-let TYPES = {};   // data/types.json: 路線名 → {order, short, types: {種別: "all" | [停車駅]}}
+// 種別と停車駅: 路線名 → {order: [種別], short?: {種別: 略称}, types: {種別: "all" | [停車駅]}}
+// data/types.json が初期値で、ブラウザで編集したもの (localStorage) がそれを路線ごとに上書きする
+let BUILTIN_TYPES = {}, USER_TYPES = loadUserTypes(), TYPES = {};
+function loadUserTypes() {
+  try { return JSON.parse(localStorage.getItem('tm-types') || '{}') || {}; } catch { return {}; }
+}
+function saveUserTypes() {
+  try { localStorage.setItem('tm-types', JSON.stringify(USER_TYPES)); } catch (e) { alert('保存できませんでした: ' + e.message); }
+  rebuildTypes();
+}
+function rebuildTypes() {
+  TYPES = { ...BUILTIN_TYPES, ...USER_TYPES };
+  S.typeLine = null;   // 判定をやり直す
+  $('typeChips').dataset.k = '';
+}
 const GRID = new Map();
 const cellKey = (ix, iy) => ix * 100000 + iy;
 
@@ -67,8 +81,9 @@ async function loadData() {
   $('attrib').textContent = '出典: ' + js.attribution;
   try {   // 種別と停車駅 (無くても動く)
     const tr = await fetch('data/types.json');
-    if (tr.ok) TYPES = await tr.json();
+    if (tr.ok) BUILTIN_TYPES = await tr.json();
   } catch (e) { console.warn('types.json', e); }
+  rebuildTypes();
   const sc = js.scale;
   PATHS = js.paths.map((p, pi) => {
     const n = p.c.length / 2;
@@ -351,7 +366,7 @@ function lineTypes() {
   const P = PATHS[S.pi];
   if (!P) return null;
   const T = TYPES[lineLabel(P.line)];
-  if (!T) return null;
+  if (!T || !T.order || !T.order.length) return null;
   if (S.typeLine !== P.line) {   // 路線が変わったら判定をやり直す
     S.typeLine = P.line; S.typeSel = null; S.typeCands = [...T.order];
   }
@@ -634,7 +649,15 @@ function renderTypes() {
   if (box.dataset.k === want) return;
   box.dataset.k = want;
   box.innerHTML = '';
-  if (!T) return;
+  if (!T) {
+    if (PATHS[S.pi]) {
+      const add = document.createElement('button');
+      add.textContent = '＋ 種別と停車駅を設定';
+      add.onclick = () => openTypeEditor();
+      box.appendChild(add);
+    }
+    return;
+  }
   const auto = document.createElement('button');
   const guess = S.typeCands.length === 1 ? typeShort(T, S.typeCands[0])
     : S.typeCands.length < T.order.length ? S.typeCands.map((c) => typeShort(T, c)).join('/') + '?' : '判定中';
@@ -649,6 +672,11 @@ function renderTypes() {
     b.onclick = () => { S.typeSel = ty; box.dataset.k = ''; };
     box.appendChild(b);
   }
+  const ed = document.createElement('button');
+  ed.textContent = '✎';
+  ed.title = '種別と停車駅を編集';
+  ed.onclick = () => openTypeEditor();
+  box.appendChild(ed);
 }
 
 function renderAlts(P) {
@@ -922,9 +950,188 @@ $('settings').addEventListener('close', () => {
   render();
 });
 
+// ------------------------------------------------------------ 種別と停車駅の編集
+// 路線を選び、種別を追加・名前変更・削除し、縦の路線図で駅をタップして停車/通過を切り替える
+const TED = { line: null, work: {}, sel: null };
+
+/** 路線の駅の並び。パスが分かれている路線 (江ノ島線の藤沢〜片瀬江ノ島など) は、
+ *  長いパスから順に、近い方の端へ向きをそろえてつなぐ */
+const lineStCache = new Map();
+function lineStations(label) {
+  if (lineStCache.has(label)) return lineStCache.get(label);
+  const li = LINES.findIndex((l) => `${l.c} ${l.n}` === label);
+  const ps = PATHS.filter((P) => P.line === li).sort((a, b) => b.len - a.len);
+  let out = [];   // [{n, lat, lon}]
+  const dist = (a, b) => Math.hypot((a.lon - b.lon) * R_LON * Math.cos(a.lat * Math.PI / 180), (a.lat - b.lat) * R_LAT);
+  for (const P of ps) {
+    const add = P.st.filter((st) => !out.some((o) => o.n === st.n)).map((st) => ({ n: st.n, ...pointAt(P, st.s) }));
+    if (!add.length) continue;
+    if (!out.length) { out = add; continue; }
+    const f = add[0], l = add[add.length - 1], F = out[0], L = out[out.length - 1];
+    const opts = [[dist(L, f), 'end'], [dist(L, l), 'endRev'], [dist(F, l), 'start'], [dist(F, f), 'startRev']];
+    const how = opts.sort((x, y) => x[0] - y[0])[0][1];
+    if (how === 'end') out = out.concat(add);
+    else if (how === 'endRev') out = out.concat(add.reverse());
+    else if (how === 'start') out = add.concat(out);
+    else out = add.reverse().concat(out);
+  }
+  const names = out.map((o) => o.n);
+  lineStCache.set(label, names);
+  return names;
+}
+
+/** 編集用の作業コピー (停車駅は必ず配列にする) */
+function tedData(label) {
+  if (!TED.work[label]) {
+    const src = TYPES[label] || { order: [], types: {} };
+    const all = lineStations(label);
+    const types = {};
+    for (const ty of src.order || []) types[ty] = src.types[ty] === 'all' ? [...all] : [...(src.types[ty] || [])];
+    TED.work[label] = { order: [...(src.order || [])], short: { ...(src.short || {}) }, types, dirty: false };
+  }
+  return TED.work[label];
+}
+
+function openTypeEditor() {
+  TED.work = {};
+  const P = PATHS[S.pi];
+  TED.line = P ? lineLabel(P.line) : TED.line;
+  TED.sel = null;
+  $('tedFilter').value = '';
+  tedLineOptions();
+  tedRender();
+  $('typeEd').showModal();
+}
+
+function tedLineOptions() {
+  const q = $('tedFilter').value.trim();
+  const labels = [...new Set(PATHS.filter((P) => P.st.length >= 2).map((P) => lineLabel(P.line)))]
+    .filter((l) => !q || l.includes(q) || l === TED.line)
+    .sort((a, b) => a.localeCompare(b, 'ja'));
+  if (!TED.line && labels.length) TED.line = labels[0];
+  $('tedLine').innerHTML = labels.map((l) =>
+    `<option value="${esc(l)}"${l === TED.line ? ' selected' : ''}>${TYPES[l] && TYPES[l].order && TYPES[l].order.length ? '★ ' : ''}${esc(l)}</option>`).join('');
+}
+
+function tedRender() {
+  if (!TED.line) return;
+  const D = tedData(TED.line);
+  if (!D.order.includes(TED.sel)) TED.sel = D.order[0] || null;
+  // 種別のボタン
+  const box = $('tedTypes');
+  box.innerHTML = '';
+  for (const ty of D.order) {
+    const b = document.createElement('button');
+    b.textContent = ty;
+    if (ty === TED.sel) b.classList.add('on');
+    b.onclick = () => { TED.sel = ty; tedRender(); };
+    box.appendChild(b);
+  }
+  const add = document.createElement('button');
+  add.textContent = '＋ 追加';
+  add.onclick = () => {
+    let k = D.order.length + 1, name;
+    do name = `種別${k++}`; while (D.order.includes(name));
+    D.order.push(name); D.types[name] = lineStations(TED.line); D.dirty = true;
+    TED.sel = name; tedRender();
+    $('tedName').focus(); $('tedName').select();
+  };
+  box.appendChild(add);
+  // 選んだ種別の名前・操作
+  const has = !!TED.sel;
+  $('tedEditRow').classList.toggle('hide', !has);
+  $('tedName').value = has ? TED.sel : '';
+  $('tedUp').disabled = !has || D.order.indexOf(TED.sel) === 0;
+  // 縦の路線図
+  const stops = has ? new Set(D.types[TED.sel]) : null;
+  const sts = lineStations(TED.line);
+  $('tedHint').textContent = has ? `駅をタップで 停車 ⇔ 通過（停車 ${sts.filter((n) => stops.has(n)).length} / ${sts.length} 駅）`
+    : '「＋ 追加」で種別を作ってください';
+  $('tedStations').innerHTML = sts.map((n, i) => {
+    const on = has && stops.has(n);
+    return `<li data-i="${i}" class="${has ? (on ? 'stop' : 'pass') : 'none'}"><span class="dot"></span><span class="nm">${esc(n)}</span>` +
+      `<span class="tag">${has ? (on ? '停車' : '通過') : ''}</span></li>`;
+  }).join('');
+  $('tedReset').disabled = !USER_TYPES[TED.line] && !D.dirty;
+}
+
+$('tedStations').addEventListener('click', (e) => {
+  const li = e.target.closest('li');
+  if (!li || !TED.sel) return;
+  const D = tedData(TED.line);
+  const n = lineStations(TED.line)[Number(li.dataset.i)];
+  const arr = D.types[TED.sel];
+  const k = arr.indexOf(n);
+  if (k >= 0) arr.splice(k, 1); else arr.push(n);
+  D.dirty = true;
+  tedRender();
+});
+$('tedFilter').addEventListener('input', tedLineOptions);
+$('tedLine').addEventListener('change', () => { TED.line = $('tedLine').value; TED.sel = null; tedRender(); });
+$('tedName').addEventListener('change', () => {
+  const D = tedData(TED.line);
+  const nm = $('tedName').value.trim();
+  if (!nm || nm === TED.sel || D.order.includes(nm)) { $('tedName').value = TED.sel; return; }
+  D.order[D.order.indexOf(TED.sel)] = nm;
+  D.types[nm] = D.types[TED.sel]; delete D.types[TED.sel];
+  if (D.short[TED.sel]) { D.short[nm] = D.short[TED.sel]; delete D.short[TED.sel]; }
+  TED.sel = nm; D.dirty = true; tedRender();
+});
+$('tedUp').onclick = () => {
+  const D = tedData(TED.line), i = D.order.indexOf(TED.sel);
+  if (i > 0) { [D.order[i - 1], D.order[i]] = [D.order[i], D.order[i - 1]]; D.dirty = true; tedRender(); }
+};
+$('tedDel').onclick = () => {
+  if (!confirm(`「${TED.sel}」を削除しますか？`)) return;
+  const D = tedData(TED.line);
+  D.order = D.order.filter((t) => t !== TED.sel); delete D.types[TED.sel];
+  TED.sel = null; D.dirty = true; tedRender();
+};
+$('tedAll').onclick = () => { const D = tedData(TED.line); D.types[TED.sel] = lineStations(TED.line); D.dirty = true; tedRender(); };
+$('tedNone').onclick = () => { const D = tedData(TED.line); D.types[TED.sel] = []; D.dirty = true; tedRender(); };
+$('tedReset').onclick = () => {
+  if (!confirm(`${TED.line} の種別をこのブラウザで編集する前の状態（初期値${BUILTIN_TYPES[TED.line] ? '' : ': 種別なし'}）に戻しますか？`)) return;
+  delete USER_TYPES[TED.line]; delete TED.work[TED.line];
+  saveUserTypes(); tedLineOptions(); tedRender();
+};
+$('tedCancel').onclick = () => $('typeEd').close();
+$('tedSave').onclick = () => {
+  for (const [label, D] of Object.entries(TED.work)) {
+    if (!D.dirty) continue;
+    const all = lineStations(label);
+    const types = {};
+    // 駅の並び順で保存。全駅停車なら "all"
+    for (const ty of D.order) types[ty] = D.types[ty].length === all.length ? 'all' : all.filter((n) => D.types[ty].includes(n));
+    const short = Object.fromEntries(Object.entries(D.short).filter(([k]) => D.order.includes(k)));
+    USER_TYPES[label] = { order: D.order, ...(Object.keys(short).length ? { short } : {}), types };
+  }
+  saveUserTypes();
+  $('typeEd').close();
+  render();
+};
+// 書き出し・読み込み (端末の移し替えやバックアップ用)
+$('tedExport').onclick = () => {
+  $('tedJson').value = JSON.stringify(USER_TYPES, null, 1);
+  $('tedJson').select();
+  if (navigator.clipboard) navigator.clipboard.writeText($('tedJson').value).then(() => { $('tedJsonMsg').textContent = 'コピーしました'; }, () => {});
+};
+$('tedImport').onclick = () => {
+  let js;
+  try { js = JSON.parse($('tedJson').value); } catch (e) { $('tedJsonMsg').textContent = 'JSON として読めません: ' + e.message; return; }
+  const ok = js && typeof js === 'object' && Object.values(js).every((v) => v && Array.isArray(v.order) && v.types &&
+    v.order.every((t) => v.types[t] === 'all' || Array.isArray(v.types[t])));
+  if (!ok) { $('tedJsonMsg').textContent = '形式が違います ({"会社 路線名": {"order": [...], "types": {...}}})'; return; }
+  Object.assign(USER_TYPES, js);
+  saveUserTypes();
+  TED.work = {};
+  tedLineOptions(); tedRender();
+  $('tedJsonMsg').textContent = `${Object.keys(js).length} 路線を読み込みました`;
+};
+
 // ------------------------------------------------------------ 起動
 $('startBtn').onclick = () => (S.running ? stop() : start());
 $('settingsBtn').onclick = openSettings;
+$('setTypes').onclick = () => { $('settings').close(); openTypeEditor(); };
 
 (async () => {
   try {

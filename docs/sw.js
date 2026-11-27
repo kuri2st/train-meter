@@ -1,5 +1,5 @@
 // オフライン用キャッシュ。アプリやデータを更新したら VERSION を上げる
-const VERSION = 'train-meter-v8';
+const VERSION = 'train-meter-v9';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icon.svg', 'data/rail.json', 'data/types.json'];
 
 self.addEventListener('install', (e) => {

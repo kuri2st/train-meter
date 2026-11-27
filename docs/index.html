@@ -77,11 +77,44 @@
       <label><input type="checkbox" id="set_tnNext"> 次のトンネルまでの距離</label>
       <label><input type="checkbox" id="set_tnSection"> 次駅までのトンネル数・合計長</label>
     </fieldset>
+    <button type="button" id="setTypes" class="wide">種別と停車駅の編集…</button>
     <div class="dlg-btns">
       <button value="cancel">閉じる</button>
       <button id="setSave" value="save" class="primary">保存</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="typeEd" class="ted">
+  <h2>種別と停車駅</h2>
+  <div class="ted-line">
+    <input id="tedFilter" type="search" placeholder="路線名で絞り込み">
+    <select id="tedLine"></select>
+  </div>
+  <div id="tedTypes" class="chips"></div>
+  <div id="tedEditRow" class="ted-edit">
+    <input id="tedName" type="text" aria-label="種別名">
+    <button type="button" id="tedUp" title="前へ">↑</button>
+    <button type="button" id="tedAll">全停車</button>
+    <button type="button" id="tedNone">全通過</button>
+    <button type="button" id="tedDel">削除</button>
+  </div>
+  <p id="tedHint" class="muted"></p>
+  <ol id="tedStations" class="route"></ol>
+  <details class="ted-json">
+    <summary>書き出し・読み込み</summary>
+    <textarea id="tedJson" rows="5" placeholder="ここに貼り付けて「読み込み」"></textarea>
+    <div class="dlg-btns">
+      <span id="tedJsonMsg" class="muted"></span>
+      <button type="button" id="tedExport">書き出し</button>
+      <button type="button" id="tedImport">読み込み</button>
+    </div>
+  </details>
+  <div class="dlg-btns">
+    <button type="button" id="tedReset">初期値に戻す</button>
+    <button type="button" id="tedCancel">閉じる</button>
+    <button type="button" id="tedSave" class="primary">保存</button>
+  </div>
 </dialog>
 
 <div id="loading" class="loading">路線データを読み込み中…</div>
