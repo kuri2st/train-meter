@@ -45,6 +45,9 @@ canvas { display: block; width: 100%; }
 .next-nums { text-align: right; }
 .big { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .following { list-style: none; padding: 0; margin: 8px 0 0; font-size: 0.9rem; }
+.following li.pass { color: var(--muted); }
+.following li.pass em { font-style: normal; font-size: 0.75rem; border: 1px solid #5b6875; border-radius: 4px;
+  padding: 0 4px; margin-right: 6px; }
 .following li { display: flex; justify-content: space-between; padding: 3px 0;
   border-top: 1px solid #2a323a; font-variant-numeric: tabular-nums; }
 .est-val { color: var(--est); }

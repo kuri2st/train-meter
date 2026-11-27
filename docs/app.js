@@ -475,23 +475,27 @@ function pushHist(t, v, est) {
 
 // ------------------------------------------------------------ 計算
 /** 進行方向の先にある駅 [{n, dist}] */
+/** 進行方向の先にある、止まる駅 n 個 [{n, dist}] */
 function stationsAhead(n) {
+  return stationsAheadAll(n).filter((a) => a.stop);
+}
+
+/** 進行方向の先にある駅を、止まる駅が n 個になるまで通過駅も含めて [{n, dist, stop}] */
+function stationsAheadAll(n) {
   const P = PATHS[S.pi];
   if (!P || S.dir === 0) return [];
   const out = [];
+  let stops = 0;
   const list = S.dir > 0 ? P.st : [...P.st].reverse();
-  const stop = S.stopSt && S.stopSt.pi === S.pi ? S.stopSt.s : null;
-  for (const st of list) {
-    const d = (st.s - S.s) * S.dir;
-    if (d > 0 && st.s !== stop && stopsAt(st.n)) out.push({ n: st.n, dist: d });
-    if (out.length >= n) return out;
-  }
-  if (P.loop) {   // 環状線は一周して続ける
-    for (const st of list) {
-      const d = (st.s - S.s) * S.dir + P.len;
-      if (d > 0 && st.s !== stop && stopsAt(st.n) && out.length < n) out.push({ n: st.n, dist: d });
-    }
-  }
+  const here = S.stopSt && S.stopSt.pi === S.pi ? S.stopSt.s : null;
+  const push = (st, d) => {
+    if (d <= 0 || st.s === here || stops >= n) return;
+    const stop = stopsAt(st.n);
+    out.push({ n: st.n, dist: d, stop });
+    if (stop) stops++;
+  };
+  for (const st of list) push(st, (st.s - S.s) * S.dir);
+  if (P.loop) for (const st of list) push(st, (st.s - S.s) * S.dir + P.len);   // 環状線は一周して続ける
   return out;
 }
 
@@ -509,17 +513,36 @@ function cruiseSpeed() {
   return Math.max(S.speed, hi);
 }
 
-/** 距離 D [m] を、今の速度 → 巡航速度まで加速 → 巡航 → 一定減速で停止、としたときの所要時間 [s] */
+/** 距離 D [m] 先の駅に止まるまでの所要時間 [s]。
+ *  今の速度 → 巡航速度まで加速 → 巡航 → 一定減速で停止、とする */
 function etaSec(D) {
+  return passSec(D, D);
+}
+
+/** 上と同じ走り方で D [m] 先に止まるとき、途中の x [m] 地点 (通過駅) に着くまでの時間 [s] */
+function passSec(x, D) {
   const vc = cruiseSpeed();
   if (vc < 1) return null;
+  x = Math.min(x, D);
   const v0 = Math.min(S.speed, vc);
-  const da = (vc * vc - v0 * v0) / (2 * ACCEL), db = vc * vc / (2 * DECEL);
-  if (da + db <= D) return (vc - v0) / ACCEL + (D - da - db) / vc + vc / DECEL;
-  // 巡航速度に届かない: 加速して最高 vp に達したらすぐ減速
-  const vp = Math.sqrt((D + v0 * v0 / (2 * ACCEL)) / (1 / (2 * ACCEL) + 1 / (2 * DECEL)));
-  if (vp <= v0) return v0 > 0 ? 2 * D / v0 : null;    // もう減速中
-  return (vp - v0) / ACCEL + vp / DECEL;
+  let vp = vc;
+  let da = (vc * vc - v0 * v0) / (2 * ACCEL);
+  const dbOf = (v) => v * v / (2 * DECEL);
+  if (da + dbOf(vc) > D) {
+    // 巡航速度に届かない: 加速して最高 vp に達したらすぐ減速
+    vp = Math.sqrt((D + v0 * v0 / (2 * ACCEL)) / (1 / (2 * ACCEL) + 1 / (2 * DECEL)));
+    if (vp <= v0) {   // もう減速中: 今の速度から一定の減速で D に止まる
+      if (v0 <= 0) return null;
+      const b = v0 * v0 / (2 * D);
+      return (v0 - Math.sqrt(Math.max(0, v0 * v0 - 2 * b * x))) / b;
+    }
+    da = (vp * vp - v0 * v0) / (2 * ACCEL);
+  }
+  const ta = (vp - v0) / ACCEL;
+  if (x <= da) return (-v0 + Math.sqrt(v0 * v0 + 2 * ACCEL * x)) / ACCEL;   // 加速中に通過
+  const dc = D - da - dbOf(vp), tc = dc / vp;
+  if (x <= da + dc) return ta + (x - da) / vp;                              // 巡航中に通過
+  return ta + tc + (vp - Math.sqrt(2 * DECEL * (D - x))) / DECEL;            // 減速中に通過
 }
 
 /** 停車中か (到着予想を時刻ではなく「発車後 約 X 分」で出す) */
@@ -575,8 +598,9 @@ function render() {
   renderAlts(P);
   renderTypes();
 
-  // 次駅
-  const ahead = stationsAhead(4);
+  // 次駅 (次に止まる駅)。その手前の通過駅は距離と通過予想時刻、その先の停車駅は距離だけ
+  const aheadAll = stationsAheadAll(4);
+  const ahead = aheadAll.filter((a) => a.stop);
   const here = stationHere();
   $('dirLabel').textContent = !P ? '' : S.dir === 0 ? '進行方向を判定中' :
     (here && S.speed < 2 ? `${here.n} 停車中` : '');
@@ -595,9 +619,13 @@ function render() {
     $('nextDist').textContent = '--';
     $('nextEta').textContent = '--';
   }
-  // 2 つ先以降は途中で停車するかもしれないので距離だけ
-  $('following').innerHTML = ahead.slice(1).map((a) =>
-    `<li><span>${esc(a.n)}</span><span>${fmtDist(a.dist)}</span></li>`).join('');
+  const when = (e) => e == null ? '--' : isStopped() ? `発車後 約${fmtDur(e)}` : fmtClock(t + e * 1000);
+  const passing = ahead.length ? aheadAll.filter((a) => !a.stop && a.dist < ahead[0].dist) : [];
+  // 2 つ先以降の停車駅は、途中の停車時間が分からないので距離だけ
+  $('following').innerHTML =
+    passing.map((a) => `<li class="pass"><span><em>通過</em>${esc(a.n)}</span>` +
+      `<span>${fmtDist(a.dist)}　${when(passSec(a.dist, ahead[0].dist))}</span></li>`).join('') +
+    ahead.slice(1).map((a) => `<li><span>${esc(a.n)}</span><span>${fmtDist(a.dist)}</span></li>`).join('');
 
   // トンネル
   const ti = tunnelInfo(ahead.length ? ahead[0].dist : null);
