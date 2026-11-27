@@ -3,9 +3,11 @@ package io.github.kuri2st.trainmeter;
 import android.Manifest;
 import android.content.Intent;
 import android.location.Location;
+import android.net.Uri;
 import android.os.Build;
 import android.view.WindowManager;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
@@ -14,12 +16,17 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * JS (docs/app.js) から使う位置取得。window.Capacitor.Plugins.TrainLocation
  *   start()                       権限を確認してサービスを開始。以後 "location" と "tick" イベントを送る
  *   stop()                        サービスを止める
  *   setNotification({title, text}) 通知の表示を変える
+ *   shareFile({name, text})       テキストをファイルにして共有画面を出す (走行ログの書き出し)
  */
 @CapacitorPlugin(
     name = "TrainLocation",
@@ -82,6 +89,32 @@ public class TrainLocationPlugin extends Plugin {
     public void setNotification(PluginCall call) {
         TrainLocationService.update(getContext(), call.getString("title", "train-meter"), call.getString("text", ""));
         call.resolve();
+    }
+
+    @PluginMethod
+    public void shareFile(PluginCall call) {
+        String name = call.getString("name", "train-meter.csv").replaceAll("[\\\\/:*?\"<>|]", "_");
+        String text = call.getString("text", "");
+        try {
+            File dir = new File(getContext().getCacheDir(), "logs");
+            if (!dir.isDirectory() && !dir.mkdirs()) throw new Exception("保存先を作れません");
+            File f = new File(dir, name);
+            try (OutputStream os = new FileOutputStream(f)) {
+                os.write(text.getBytes(StandardCharsets.UTF_8));
+            }
+            Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", f);
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType("text/csv");
+            send.putExtra(Intent.EXTRA_STREAM, uri);
+            send.putExtra(Intent.EXTRA_SUBJECT, name);
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            Intent chooser = Intent.createChooser(send, name);
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(chooser);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("書き出せませんでした: " + e.getMessage());
+        }
     }
 
     @Override

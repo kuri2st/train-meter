@@ -67,6 +67,16 @@
 <dialog id="settings">
   <form method="dialog">
     <h2>設定</h2>
+    <fieldset>
+      <legend>走行ログ（予想や判定の改善用）</legend>
+      <label><input type="checkbox" id="setLog"> 記録する（「開始」〜「停止」を 1 件として保存）</label>
+      <select id="logSess" class="log-sess"></select>
+      <div class="log-btns">
+        <button type="button" id="logExport">CSV で書き出し</button>
+        <button type="button" id="logDel">削除</button>
+        <button type="button" id="logDelAll">全削除</button>
+      </div>
+    </fieldset>
     <label class="row">速度履歴の長さ [秒]
       <input id="setHist" type="number" min="30" max="1800" step="10" inputmode="numeric">
     </label>

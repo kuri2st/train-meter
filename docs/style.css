@@ -108,3 +108,9 @@ dialog.ted { width: min(520px, calc(100vw - 24px)); max-height: calc(100vh - 24p
 .ted-json summary { color: var(--muted); cursor: pointer; padding: 4px 0; }
 .ted-json .dlg-btns { align-items: center; margin-top: 6px; }
 .ted-json .dlg-btns .muted { flex: 1; }
+
+/* 走行ログ */
+.log-sess { width: 100%; font: inherit; padding: 6px 8px; border-radius: 8px; border: 1px solid #3a4550;
+  background: var(--bg); color: var(--fg); margin: 4px 0; }
+.log-btns { display: flex; gap: 6px; margin-bottom: 4px; }
+.log-btns button { flex: 1; padding: 8px 4px; font-size: 0.85rem; }

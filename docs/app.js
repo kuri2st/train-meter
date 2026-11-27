@@ -27,7 +27,7 @@ const STOP_MARGIN = 40;                 // 駅 (ホーム) の範囲からこの
 const STOP_RADIUS = 200;                // 範囲の無い古いデータ用: 駅の中心からの距離 [m] (+ GPS 精度)
 const HIST_MAX_SEC = 1800;
 
-const DEFAULTS = { histSec: 180, tnInside: true, tnExit: true, tnNext: true, tnSection: true };
+const DEFAULTS = { logOn: false, histSec: 180, tnInside: true, tnExit: true, tnNext: true, tnSection: true };
 const TN_KEYS = ['tnInside', 'tnExit', 'tnNext', 'tnSection'];
 
 const $ = (id) => document.getElementById(id);
@@ -191,7 +191,7 @@ function onFix(fix) {
   const t = now();
   const { lat, lon, accuracy } = fix;
   S.acc = accuracy;
-  if (accuracy > ACC_LIMIT) return;      // 精度が悪い (トンネル内の基地局測位など)
+  if (accuracy > ACC_LIMIT) { logFix(t, fix, 'rejected'); return; }   // 精度が悪い (トンネル内の基地局測位など)
 
   // 速度: GPS の値を優先、無ければ前回位置との差
   let v = fix.speed;
@@ -281,6 +281,11 @@ function onFix(fix) {
     } else {
       s = chosen.s; S.sVar = Math.max(accuracy, 5) ** 2;
       dir = 0; S.anchorS = s; S.stopSt = null;
+      // つながる別のパスへ移ったなら、入った端から進行方向が分かる
+      if (S.pi >= 0 && S.dir !== 0) {
+        const lk = pathLink(S.pi, S.dir > 0 ? 1 : 0);
+        if (lk && lk.qi === chosen.pi) dir = lk.entry === 0 ? 1 : -1;
+      }
     }
     // 進行方向: 走行中なら GPS の向き、向きが無ければ一定距離動いた向き。停止中は変えない
     if (v <= 1) S.anchorS = s;
@@ -299,12 +304,13 @@ function onFix(fix) {
     S.pi = -1; S.dir = 0; S.alts = [];   // 線路から離れた
   }
   S.speed = v;
-  if (isolated) { updateStop(t); return; }
+  if (isolated) { updateStop(t); logFix(t, fix, 'isolated'); return; }
   S.est = false;
   S.lastFixAt = t;
   S.lastFix = { t, lat, lon };
   pushHist(t, v, false);
   updateStop(t);
+  logFix(t, fix, '');
   if (NATIVE) updateNotification(t);
 }
 
@@ -313,6 +319,7 @@ function resetAfterGap() {
   S.lastFixAt = 0; S.lastFix = null; S.est = false;
   S.vRaw = []; S.fixes = []; S.stopSt = null; S.slowSince = 0;
   S.afterGap = true;
+  logEvent('gap', '', 'バックグラウンドから復帰');
 }
 
 /** 生の速度から外れ値を除く: 直近 3 点の中央値 → 前回からの変化を加減速度の上限で制限 */
@@ -355,6 +362,7 @@ function updateStop(t) {
     if (g <= 0 && d < bd) { best = st; bd = d; }
   }
   if (best) {
+    if (!S.stopSt || S.stopSt.n !== best.n) logEvent('arrive', best.n, `中心から ${Math.round((S.s - best.s) * (S.dir || 1))} m`);
     S.stopSt = { pi: S.pi, s: best.s, a: best.a, b: best.b, n: best.n };
     typeEvidence(best.n, true);
   }
@@ -414,7 +422,10 @@ function checkPassing(P, v) {
   if (pc && (pc.pi !== S.pi || pc.n !== (inside && inside.n))) {
     // 範囲を出た: 進行方向の先へ抜け、ずっと速く、推定も挟まず、そこで停車もしていなければ通過
     const ahead = (S.s - pc.s) * S.dir > 0;
-    if (pc.pi === S.pi && ahead && pc.minV > PASS_V && !pc.est && !(S.stopSt && S.stopSt.n === pc.n)) typeEvidence(pc.n, false);
+    if (pc.pi === S.pi && ahead && pc.minV > PASS_V && !pc.est && !(S.stopSt && S.stopSt.n === pc.n)) {
+      typeEvidence(pc.n, false);
+      logEvent('pass', pc.n, `最低 ${Math.round(pc.minV * 3.6)} km/h`);
+    }
     S.passCheck = null;
   }
   if (inside) {
@@ -463,7 +474,7 @@ function tick() {
     }
     S.sVar += (3 * dt) ** 2;
     const last = S.hist[S.hist.length - 1];
-    if (!last || t - last.t >= 1000) pushHist(t, S.speed, true);
+    if (!last || t - last.t >= 1000) { pushHist(t, S.speed, true); logRow({ t, k: 'est', ...logState(t) }); }
     updateStop(t);
   }
 }
@@ -495,8 +506,67 @@ function stationsAheadAll(n) {
     if (stop) stops++;
   };
   for (const st of list) push(st, (st.s - S.s) * S.dir);
-  if (P.loop) for (const st of list) push(st, (st.s - S.s) * S.dir + P.len);   // 環状線は一周して続ける
+  if (P.loop) { for (const st of list) push(st, (st.s - S.s) * S.dir + P.len); return out; }   // 環状線は一周して続ける
+  // パスの端まで来たら、同じ路線のつながる別のパスへ続ける (スイッチバックやデータの切れ目)
+  let cur = S.pi, exitEnd = S.dir > 0 ? 1 : 0, off = S.dir > 0 ? P.len - S.s : S.s;
+  const seen = new Set([cur]), names = new Set(out.map((a) => a.n));
+  if (here != null && S.stopSt) names.add(S.stopSt.n);
+  for (let hop = 0; hop < 3 && stops < n; hop++) {
+    const lk = pathLink(cur, exitEnd);
+    if (!lk || seen.has(lk.qi)) break;
+    seen.add(lk.qi);
+    const Q = PATHS[lk.qi];
+    off += lk.gap;
+    const qs = lk.entry === 0 ? Q.st : [...Q.st].reverse();
+    for (const st of qs) {
+      if (names.has(st.n)) continue;
+      names.add(st.n);
+      push(st, off + (lk.entry === 0 ? st.s : Q.len - st.s));
+    }
+    off += Q.len; cur = lk.qi; exitEnd = 1 - lk.entry;
+  }
   return out;
+}
+
+/** パス pi の端 (0=始点, 1=終点) から続く同じ路線の別のパス {qi, entry (0=始点から入る / 1=終点から), gap [m]}。
+ *  データでは、スイッチバック (藤沢など) や一部の区間でパスが切れているので、端どうしが近いものをつなぐ。
+ *  入った先がすぐ元のパスに沿って戻る (並走する別の線路・折り返し線) ものは除く */
+const LINK_MAX = 1000;
+const linkCache = new Map();
+function pathLink(pi, end) {
+  const key = pi * 2 + end;
+  if (linkCache.has(key)) return linkCache.get(key);
+  const P = PATHS[pi];
+  const e = pointAt(P, end ? P.len : 0);
+  let best = null;
+  PATHS.forEach((Q, qi) => {
+    if (qi === pi || Q.line !== P.line || Q.loop || !Q.st.length) return;
+    for (const entry of [0, 1]) {
+      const q = pointAt(Q, entry ? Q.len : 0);
+      const gap = geoDist(e, q);
+      if (gap > LINK_MAX || (best && gap >= best.gap)) continue;
+      const probe = pointAt(Q, entry ? Math.max(0, Q.len - 1000) : Math.min(Q.len, 1000));
+      if (distToPath(P, probe) < 250) continue;   // 元のパスに沿っている
+      best = { qi, entry, gap };
+    }
+  });
+  linkCache.set(key, best);
+  return best;
+}
+function geoDist(a, b) {
+  return Math.hypot((a.lon - b.lon) * R_LON * Math.cos(a.lat * Math.PI / 180), (a.lat - b.lat) * R_LAT);
+}
+/** 点からパスまでの最短距離 [m] */
+function distToPath(P, p) {
+  const cl = Math.cos(p.lat * Math.PI / 180);
+  let best = Infinity;
+  for (let k = 0; k < P.lon.length - 1; k++) {
+    const ax = (P.lon[k] - p.lon) * R_LON * cl, ay = (P.lat[k] - p.lat) * R_LAT;
+    const dx = (P.lon[k + 1] - P.lon[k]) * R_LON * cl, dy = (P.lat[k + 1] - P.lat[k]) * R_LAT, L2 = dx * dx + dy * dy;
+    const t = L2 > 0 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / L2)) : 0;
+    best = Math.min(best, Math.hypot(ax + t * dx, ay + t * dy));
+  }
+  return best;
 }
 
 /** 停車中の駅 (updateStop で着いたと判定した駅) */
@@ -715,7 +785,7 @@ function renderTypes() {
     const b = document.createElement('button');
     b.textContent = typeShort(T, ty);
     if (S.typeSel === ty) b.classList.add('on');
-    b.onclick = () => { S.typeSel = ty; box.dataset.k = ''; };
+    b.onclick = () => { S.typeSel = ty; box.dataset.k = ''; logEvent('type', '', `手動で ${ty}`); };
     box.appendChild(b);
   }
   const ed = document.createElement('button');
@@ -900,6 +970,7 @@ async function startNative() {
 function start() {
   S.running = true;
   $('startBtn').textContent = '停止';
+  logStart();
   if (SIM) { requestWakeLock(); startSim(SIM); return; }
   if (NATIVE) { startNative(); return; }
   requestWakeLock();
@@ -915,6 +986,9 @@ function start() {
 }
 
 function stop() {
+  if (S.running) logEvent('stop', '', '');
+  logFlush();
+  LOG.sess = 0;
   S.running = false;
   $('startBtn').textContent = '開始';
   if (watchId != null) navigator.geolocation.clearWatch(watchId);
@@ -983,6 +1057,8 @@ function startSim(q) {
 
 // ------------------------------------------------------------ 設定画面
 function openSettings() {
+  $('setLog').checked = settings.logOn;
+  logListSessions();
   $('setHist').value = settings.histSec;
   for (const k of TN_KEYS) $('set_' + k).checked = settings[k];
   $('settings').showModal();
@@ -992,9 +1068,148 @@ $('settings').addEventListener('close', () => {
   const h = Math.round(Number($('setHist').value));
   settings.histSec = Math.min(1800, Math.max(30, Number.isFinite(h) ? h : DEFAULTS.histSec));
   for (const k of TN_KEYS) settings[k] = $('set_' + k).checked;
+  const logWas = settings.logOn;
+  settings.logOn = $('setLog').checked;
   saveSettings();
+  if (S.running && settings.logOn && !logWas) logStart();
+  if (!settings.logOn && logWas) { logFlush(); LOG.sess = 0; }
   render();
 });
+
+// ------------------------------------------------------------ 走行ログ
+// 予想や判定の改善用に、測位ごと (推定中は 1 秒ごと) の生データと判定結果、到着・通過などの出来事を
+// IndexedDB に記録し、CSV で書き出す。「開始」〜「停止」を 1 つの記録 (セッション) にする
+const LOG = { db: null, buf: [], sess: 0 };
+const LOG_COLS = ['time', 't', 'kind', 'lat', 'lon', 'acc', 'v_raw_kmh', 'heading', 'v_kmh', 'est', 'line', 's', 'dir',
+  'next', 'next_dist', 'eta', 'type', 'here', 'note'];
+
+function logDb() {
+  if (LOG.db) return Promise.resolve(LOG.db);
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('tm-log', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('rows', { autoIncrement: true }).createIndex('sess', 'sess');
+    r.onsuccess = () => { LOG.db = r.result; res(LOG.db); };
+    r.onerror = () => rej(r.error);
+  });
+}
+const txDone = (tx) => new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = tx.onabort = () => rej(tx.error); });
+const reqDone = (rq) => new Promise((res, rej) => { rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error); });
+
+function logSessions() {
+  try { return JSON.parse(localStorage.getItem('tm-log-sess') || '[]'); } catch { return []; }
+}
+function logStart() {
+  if (!settings.logOn) return;
+  LOG.sess = Date.now();
+  const list = logSessions();
+  list.push({ sess: LOG.sess, sim: SIM || '' });
+  try { localStorage.setItem('tm-log-sess', JSON.stringify(list)); } catch { /* 記録自体は続ける */ }
+  logEvent('start', '', SIM ? `模擬走行 ${SIM}` : NATIVE ? 'アプリ' : 'ブラウザ');
+}
+function logRow(row) {
+  if (!settings.logOn || !LOG.sess) return;
+  row.sess = LOG.sess;
+  LOG.buf.push(row);
+  if (LOG.buf.length >= 60) logFlush();
+}
+async function logFlush() {
+  if (!LOG.buf.length) return;
+  const rows = LOG.buf;
+  LOG.buf = [];
+  try {
+    const db = await logDb();
+    const tx = db.transaction('rows', 'readwrite');
+    for (const r of rows) tx.objectStore('rows').add(r);
+    await txDone(tx);
+  } catch (e) { console.warn('log', e); }
+}
+setInterval(logFlush, 5000);
+document.addEventListener('visibilitychange', () => { if (document.hidden) logFlush(); });
+
+/** その時点の判定結果 (路線・位置・次駅・到着予想・種別) */
+function logState(t) {
+  const P = PATHS[S.pi];
+  const st = { v_kmh: +(S.speed * 3.6).toFixed(1), est: S.est ? 1 : 0 };
+  if (!P) return st;
+  st.line = lineLabel(P.line); st.s = Math.round(S.s); st.dir = S.dir;
+  const nx = stationsAhead(1)[0];
+  if (nx) {
+    st.next = nx.n; st.next_dist = Math.round(nx.dist);
+    const e = nextEtaSec(nx, t);
+    if (e != null && !isStopped()) st.eta = t + e * 1000;
+  }
+  const T = lineTypes();
+  if (T) st.type = (S.typeSel ? S.typeSel + '(手動)' : S.typeCands.join('/'));
+  const here = stationHere();
+  if (here) st.here = here.n;
+  return st;
+}
+function logFix(t, fix, note) {
+  if (!LOG.sess) return;
+  const num = (x, k) => (x == null || Number.isNaN(x) ? '' : +x.toFixed(k));
+  logRow({ t, k: 'fix', lat: +fix.lat.toFixed(6), lon: +fix.lon.toFixed(6), acc: num(fix.accuracy, 1),
+    v_raw_kmh: num(fix.speed == null ? null : fix.speed * 3.6, 1), heading: num(fix.heading, 0),
+    ...logState(t), note });
+}
+function logEvent(ev, n, note) {
+  if (!LOG.sess) return;
+  logRow({ t: now(), k: ev, ...logState(now()), here: n || stationHere()?.n || '', note });
+}
+
+async function logListSessions() {
+  const sel = $('logSess');
+  const list = logSessions().sort((a, b) => b.sess - a.sess);
+  let counts = [];
+  try {
+    const db = await logDb();
+    const idx = db.transaction('rows').objectStore('rows').index('sess');
+    counts = await Promise.all(list.map((x) => reqDone(idx.count(IDBKeyRange.only(x.sess)))));
+  } catch (e) { console.warn('log', e); }
+  sel.innerHTML = list.map((x, i) => `<option value="${x.sess}">${fmtDateTime(x.sess)}${x.sim ? ' 模擬' : ''}（${counts[i] ?? '?'} 行）</option>`).join('')
+    || '<option value="">記録はありません</option>';
+}
+const fmtDateTime = (ms) => new Date(ms).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+async function logExport(sess) {
+  await logFlush();
+  const db = await logDb();
+  const rows = await reqDone(db.transaction('rows').objectStore('rows').index('sess').getAll(IDBKeyRange.only(sess)));
+  const cell = (v) => v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+  const iso = (ms) => { const d = new Date(ms); return new Date(ms - d.getTimezoneOffset() * 60000).toISOString().replace('Z', '').replace('T', ' '); };
+  const lines = rows.map((r) => LOG_COLS.map((c) => cell(c === 'time' ? iso(r.t) : c === 'kind' ? r.k : c === 'eta' && r.eta ? iso(r.eta) : r[c])).join(','));
+  const text = '\ufeff' + LOG_COLS.join(',') + '\n' + lines.join('\n') + '\n';   // BOM 付き (Excel で文字化けしないように)
+  const d = new Date(sess), pad = (x) => String(x).padStart(2, '0');
+  const name = `train-meter-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.csv`;
+  if (NATIVE && TrainLocation.shareFile) { await TrainLocation.shareFile({ name, text }); return; }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+async function logDelete(sess) {
+  await logFlush();
+  const db = await logDb();
+  const tx = db.transaction('rows', 'readwrite');
+  if (sess == null) tx.objectStore('rows').clear();
+  else {
+    const cur = tx.objectStore('rows').index('sess').openKeyCursor(IDBKeyRange.only(sess));
+    cur.onsuccess = () => { const c = cur.result; if (c) { tx.objectStore('rows').delete(c.primaryKey); c.continue(); } };
+  }
+  await txDone(tx);
+  const list = sess == null ? [] : logSessions().filter((x) => x.sess !== sess);
+  localStorage.setItem('tm-log-sess', JSON.stringify(list));
+  logListSessions();
+}
+$('logExport').onclick = () => {
+  const v = Number($('logSess').value);
+  if (v) logExport(v).catch((e) => alert('書き出せませんでした: ' + (e.message || e)));
+};
+$('logDel').onclick = () => {
+  const v = Number($('logSess').value);
+  if (v && confirm(`${fmtDateTime(v)} の記録を削除しますか？`)) logDelete(v);
+};
+$('logDelAll').onclick = () => { if (confirm('走行ログをすべて削除しますか？')) logDelete(null); };
 
 // ------------------------------------------------------------ 種別と停車駅の編集
 // 路線を選び、種別を追加・名前変更・削除し、縦の路線図で駅をタップして停車/通過を切り替える
