@@ -22,7 +22,8 @@ const ACC_LIMIT = 150;                  // これより精度が悪い測位は�
 const A_MAX = 1.5;                      // 速度の変化として許す加減速度 [m/s^2] (列車は通常 1 前後)
 const STOP_V = 1.5;                     // これ未満を停止とみなす [m/s]
 const STOP_HOLD_MS = 3000;              // この時間停止が続いたら駅に着いたとみなす
-const STOP_RADIUS = 150;                // 駅とみなす距離 [m] (+ GPS 精度、最大 +100)
+const STOP_MARGIN = 40;                 // 駅 (ホーム) の範囲からこの距離までは駅とみなす [m] (+ GPS 精度、最大 +100)
+const STOP_RADIUS = 200;                // 範囲の無い古いデータ用: 駅の中心からの距離 [m] (+ GPS 精度)
 const HIST_MAX_SEC = 1800;
 
 const DEFAULTS = { histSec: 180, tnInside: true, tnExit: true, tnNext: true, tnSection: true };
@@ -87,7 +88,7 @@ async function loadData() {
     }
     return {
       line: p.l, lon, lat, cd, len: cd[n - 1], loop: !!p.o,
-      st: p.s.map(([nm, s]) => ({ n: nm, s })),
+      st: p.s.map(([nm, s, a, b]) => ({ n: nm, s, a: a ?? s, b: b ?? s })),   // a〜b: 駅 (ホーム) の範囲
       tn: p.t.map(([a, b, nm]) => ({ a, b, n: nm || null })),
     };
   });
@@ -306,17 +307,29 @@ function wrapS(P, s) {
 function updateStop(t) {
   const P = PATHS[S.pi];
   if (!P) { S.stopSt = null; return; }
-  const radius = STOP_RADIUS + Math.min(S.acc || 0, 100);
-  if (S.stopSt && (S.stopSt.pi !== S.pi || Math.abs(ringDiff(P, S.stopSt.s, S.s)) > radius + 200)) S.stopSt = null;
+  const acc = Math.min(S.acc || 0, 100);
+  if (S.stopSt && (S.stopSt.pi !== S.pi || stationGap(P, S.stopSt, acc) > 200)) S.stopSt = null;
   if (S.speed >= STOP_V) { S.slowSince = 0; return; }
   if (!S.slowSince) S.slowSince = t;
   if (t - S.slowSince < STOP_HOLD_MS) return;
   let best = null, bd = Infinity;
   for (const st of P.st) {
+    const g = stationGap(P, st, acc);
     const d = Math.abs(ringDiff(P, st.s, S.s));
-    if (d <= radius && d < bd) { best = st; bd = d; }
+    if (g <= 0 && d < bd) { best = st; bd = d; }
   }
-  if (best) S.stopSt = { pi: S.pi, s: best.s, n: best.n };
+  if (best) S.stopSt = { pi: S.pi, s: best.s, a: best.a, b: best.b, n: best.n };
+}
+
+/** 現在位置が駅とみなす範囲からどれだけ外れているか [m] (0 以下なら範囲内)
+ *  長い編成の端に乗っていると駅の中心から 150 m 以上離れるので、ホームの範囲で判定する */
+function stationGap(P, st, acc) {
+  const d = ringDiff(P, S.s, st.s);           // 駅の中心から見た現在位置 (パスの向き)
+  if (st.b - st.a > 20) {
+    const m = STOP_MARGIN + acc;
+    return Math.max((st.a - st.s) - m - d, d - (st.b - st.s) - m);
+  }
+  return Math.abs(d) - (STOP_RADIUS + acc);
 }
 
 /** 推定に入るとき、直前に減速していたらその減速を続ける (駅に止まる途中で GPS が途切れた場合) */

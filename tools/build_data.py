@@ -12,7 +12,7 @@ train-meter 配信用データ作成スクリプト
 処理の流れ
   1. 路線ごとに区間をつなぎ、分岐点ではまっすぐ続く方をつないで「パス」(一本の折れ線) を作る
   2. 折れ線を間引く (Douglas-Peucker, 許容 3 m)
-  3. 駅をパス上に投影し、起点からの距離 [m] を持たせる
+  3. 駅をパス上に投影し、起点からの距離 [m] と駅 (ホーム) の範囲 [m] を持たせる
   4. OSM のトンネルをパスに重ね、パス上の区間 [開始 m, 終了 m] として持たせる
 
 Spyder で実行する想定。
@@ -149,7 +149,7 @@ def load_stations():
     path = find_one("*Station*.geojson")
     with open(path, encoding="utf-8") as f:
         gj = json.load(f)
-    st = defaultdict(list)     # (路線名, 会社) -> [(駅名, lon, lat)]
+    st = defaultdict(list)     # (路線名, 会社) -> [(駅名, lon, lat, 駅の線分の座標)]
     for ft in gj["features"]:
         p = ft["properties"]
         c = np.asarray(ft["geometry"]["coordinates"], dtype=float)
@@ -160,7 +160,7 @@ def load_stations():
         half = cd[-1] / 2
         lon = float(np.interp(half, cd, c[:, 0]))
         lat = float(np.interp(half, cd, c[:, 1]))
-        st[(p["N02_003"], p["N02_004"])].append((p["N02_005"], lon, lat))
+        st[(p["N02_003"], p["N02_004"])].append((p["N02_005"], lon, lat, c))
     print(f"駅 {sum(len(v) for v in st.values())} 件")
     return st
 
@@ -379,22 +379,28 @@ def main():
         if li is None:
             n_unplaced += len(sts)
             continue
-        for sname, lon, lat in sts:
+        for sname, lon, lat, sc in sts:
             placed = False
             for pi in by_line[li]:
                 p = paths[pi]
                 s, d = project(p["fc"], p["cd"], lon, lat)
                 if d <= STATION_MATCH_M:
-                    p["st"].append((sname, s))
+                    # 駅 (ホーム) の範囲: 駅の線分の各点をパスに投影した最小〜最大
+                    ss = [s]
+                    for x, y in sc:
+                        sv, dv = project(p["fc"], p["cd"], x, y)
+                        if dv <= STATION_MATCH_M and abs(sv - s) <= 600:
+                            ss.append(sv)
+                    p["st"].append((sname, s, min(ss), max(ss)))
                     placed = True
             n_unplaced += not placed
     for p in paths:
         p["st"].sort(key=lambda x: x[1])
         ded = []
-        for nm, s in p["st"]:
+        for nm, s, a, b in p["st"]:
             if ded and ded[-1][0] == nm and s - ded[-1][1] < 500:
                 continue
-            ded.append((nm, s))
+            ded.append((nm, s, a, b))
         p["st"] = ded
     print(f"駅: パスに載らなかったもの {n_unplaced} 件")
 
@@ -459,7 +465,7 @@ def main():
             "l": p["line"],
             "c": flat,
             **({"o": 1} if p["loop"] else {}),
-            "s": [[nm, round(s, 1)] for nm, s in p["st"]],
+            "s": [[nm, round(s, 1), round(a, 1), round(b, 1)] for nm, s, a, b in p["st"]],
             "t": [[round(a, 1), round(b, 1)] + ([nm] if nm else []) for a, b, nm in p["tn"]],
         })
     out = {
