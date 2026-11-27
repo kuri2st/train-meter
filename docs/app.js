@@ -83,6 +83,10 @@ async function loadData() {
     const tr = await fetch('data/types.json');
     if (tr.ok) BUILTIN_TYPES = await tr.json();
   } catch (e) { console.warn('types.json', e); }
+  try {   // 運転系統の停車駅の並び (正式路線をまたいで次駅を出すため。無くても動く)
+    const rr = await fetch('data/routes.json');
+    if (rr.ok) ROUTES = await rr.json();
+  } catch (e) { console.warn('routes.json', e); }
   rebuildTypes();
   const sc = js.scale;
   PATHS = js.paths.map((p, pi) => {
@@ -113,9 +117,42 @@ async function loadData() {
       tn: p.t.map(([a, b, nm]) => ({ a, b, n: nm || null })),
     };
   });
+  // 「路線|駅名」→ 駅の位置 (同じ路線で複数のパスにあるときは最初のもの)
+  PATHS.forEach((P, pi) => {
+    for (const st of P.st) {
+      const key = `${lineLabel(P.line)}|${st.n}`;
+      if (!STATION_POS.has(key)) STATION_POS.set(key, { pi, s: st.s, ...pointAt(P, st.s) });
+    }
+  });
 }
 
 const lineLabel = (li) => `${LINES[li].c} ${LINES[li].n}`;
+
+// 運転系統: 種別名 → 停車駅の並び [[路線, 駅名], ...] (data/routes.json、OSM から作成)
+let ROUTES = {};
+const STATION_POS = new Map();
+
+/** 今の種別が運転系統ならその名前 (京浜東北線・根岸線 など)、そうでなければ null */
+function currentRoute() {
+  const T = lineTypes();
+  const ty = currentType(T);
+  return ty && ROUTES[ty] ? ty : null;
+}
+
+/** 運転系統が通る正式路線 (line index の集合)。路線の当てはめで乗り換えを選びやすくするため */
+function routeLines(name) {
+  const r = ROUTES[name];
+  if (!r) return null;
+  if (!r._lines) r._lines = new Set(r.map(([lab]) => LINES.findIndex((l) => `${l.c} ${l.n}` === lab)));
+  return r._lines;
+}
+
+/** 路線名の表示: 運転系統が決まっていれば系統名を大きく、正式名を小さく */
+function lineDisplay(P) {
+  if (!P) return { main: S.running ? '線路の近くにいません' : '路線未判定', sub: '' };
+  const r = currentRoute();
+  return r ? { main: r, sub: lineLabel(P.line) } : { main: lineLabel(P.line), sub: '' };
+}
 
 /** 点の近くにあるパスを探し、パスごとに最も近い投影を返す */
 function candidates(lat, lon, radius) {
@@ -182,6 +219,7 @@ const S = {
   lastFixAt: 0, lastFix: null, lastTick: 0, lastMatchAt: 0,
   alts: [],                    // 区別できない路線の候補 (line index)
   pinnedLine: null, pinnedSeen: 0,
+  routeNow: null,              // 決まっている運転系統 (路線をまたいで引き継ぐ)
   hist: [],                    // [{t, v, est}]
 };
 
@@ -233,7 +271,11 @@ function onFix(fix) {
       let cost = (c.d / sig) ** 2;
       if (S.pi >= 0) {
         if (c.pi === S.pi) cost += (Math.abs(c.s - pred) / 200) ** 2;
-        else cost += c.line === PATHS[S.pi].line ? 1 : 2.5;
+        else {
+          // 運転系統が決まっていれば、その系統が通る路線への乗り換えは同じ路線並みに扱う (東京で東北線→東海道線など)
+          const rl = S.routeNow ? routeLines(S.routeNow) : null;
+          cost += c.line === PATHS[S.pi].line || (rl && rl.has(c.line)) ? 1 : 2.5;
+        }
       }
       if (v > 3 && fix.heading != null && !Number.isNaN(fix.heading)) {
         const ad = Math.min(angDiff(fix.heading, c.bearing), angDiff(fix.heading, c.bearing + 180));
@@ -311,6 +353,7 @@ function onFix(fix) {
   pushHist(t, v, false);
   updateStop(t);
   logFix(t, fix, '');
+  S.routeNow = currentRoute();   // 画面を消している間 (render が動かない) も系統を覚えておく
   if (NATIVE) updateNotification(t);
 }
 
@@ -375,8 +418,14 @@ function lineTypes() {
   if (!P) return null;
   const T = TYPES[lineLabel(P.line)];
   if (!T || !T.order || !T.order.length) return null;
-  if (S.typeLine !== P.line) {   // 路線が変わったら判定をやり直す
-    S.typeLine = P.line; S.typeSel = null; S.typeCands = [...T.order];
+  if (S.typeLine !== P.line) {
+    // 路線が変わったら判定をやり直す。ただし運転系統で乗り入れた (京浜東北線が東北線→東海道線) ときは
+    // 同じ名前の種別が新しい路線にもあれば引き継ぐ
+    const keep = S.routeNow && T.order.includes(S.routeNow) ? S.routeNow : null;
+    const manual = keep && S.typeSel === keep;
+    S.typeLine = P.line;
+    S.typeSel = manual ? keep : null;
+    S.typeCands = keep ? [keep] : [...T.order];
   }
   return T;
 }
@@ -505,7 +554,31 @@ function stationsAheadAll(n) {
     out.push({ n: st.n, dist: d, stop });
     if (stop) stops++;
   };
-  for (const st of list) push(st, (st.s - S.s) * S.dir);
+  // 運転系統が別の路線へ続く (京浜東北線は東京で東北線→東海道線、横浜で根岸線へ) なら、
+  // 今の路線は系統が離れる駅までにして、その先は系統の停車駅の並びで続ける
+  const rc = routeContinuation(P);
+  for (const st of list) {
+    const d = (st.s - S.s) * S.dir;
+    if (rc && d > rc.dEnd + 1) continue;
+    push(st, d);
+  }
+  if (rc) {
+    const names = new Set(out.map((a) => a.n));
+    if (S.stopSt) names.add(S.stopSt.n);
+    let prev = rc.endPos, off = rc.dEnd;
+    for (const [lab, nm] of rc.next) {
+      if (stops >= n) break;
+      const p = STATION_POS.get(`${lab}|${nm}`);
+      if (!p) continue;
+      off += p.pi === prev.pi ? Math.abs(p.s - prev.s) : geoDist(prev, p);
+      prev = p;
+      if (names.has(nm) || nm === rc.endName) continue;
+      names.add(nm);
+      out.push({ n: nm, dist: off, stop: true, other: lab });
+      stops++;
+    }
+    return out;
+  }
   if (P.loop) { for (const st of list) push(st, (st.s - S.s) * S.dir + P.len); return out; }   // 環状線は一周して続ける
   // パスの端まで来たら、同じ路線のつながる別のパスへ続ける (スイッチバックやデータの切れ目)
   let cur = S.pi, exitEnd = S.dir > 0 ? 1 : 0, off = S.dir > 0 ? P.len - S.s : S.s;
@@ -526,6 +599,29 @@ function stationsAheadAll(n) {
     off += Q.len; cur = lk.qi; exitEnd = 1 - lk.entry;
   }
   return out;
+}
+
+/** 運転系統が今の路線を離れて別の路線へ続くとき、{dEnd: 離れる駅までの距離, endName, endPos, next: その先の [[路線, 駅名]]}。
+ *  系統が決まっていない・今の路線で系統が終わる・もう離れる駅を過ぎている ときは null */
+function routeContinuation(P) {
+  const name = currentRoute();
+  const seq = name && ROUTES[name];
+  if (!seq) return null;
+  const lab = lineLabel(P.line);
+  const sOf = (nm) => { const st = P.st.find((x) => x.n === nm); return st ? st.s : null; };
+  const idx = [];
+  seq.forEach(([l, nm], i) => { if (l === lab && sOf(nm) != null) idx.push(i); });
+  if (idx.length < 2) return null;
+  // 系統の並びの向きと進行方向が合っているか (並びの先頭→末尾がパス上で進行方向か)
+  const i0 = idx[0], i1 = idx[idx.length - 1];
+  const fwd = (sOf(seq[i1][1]) - sOf(seq[i0][1])) * S.dir > 0;
+  const exit = fwd ? i1 : i0;
+  const next = fwd ? seq.slice(exit + 1) : seq.slice(0, exit).reverse();
+  if (!next.some(([l]) => l !== lab)) return null;   // この路線で終わる
+  const endName = seq[exit][1], sEnd = sOf(endName);
+  const dEnd = (sEnd - S.s) * S.dir;
+  if (dEnd < -200) return null;                       // 離れる駅を過ぎた (路線の当てはめが切り替わるまで)
+  return { dEnd: Math.max(0, dEnd), endName, endPos: { pi: S.pi, s: sEnd, ...pointAt(P, sEnd) }, next };
 }
 
 /** パス pi の端 (0=始点, 1=終点) から続く同じ路線の別のパス {qi, entry (0=始点から入る / 1=終点から), gap [m]}。
@@ -679,7 +775,10 @@ function render() {
 
   // 路線
   const P = PATHS[S.pi];
-  $('lineName').textContent = P ? lineLabel(P.line) : (S.running ? '線路の近くにいません' : '路線未判定');
+  S.routeNow = currentRoute();
+  const ld = lineDisplay(P);
+  $('lineName').textContent = ld.main;
+  $('lineSub').textContent = ld.sub;
   renderAlts(P);
   renderTypes();
 
@@ -740,7 +839,7 @@ function updateNotification(t) {
   if (!NATIVE || !S.running || t - lastNotif.t < 2000) return;
   const P = PATHS[S.pi];
   const spd = S.lastFixAt || S.est ? `${Math.round(S.speed * 3.6)} km/h` : '測位待ち';
-  const title = `${spd}${S.est ? '（推定）' : ''}　${P ? lineLabel(P.line) : '線路の近くにいません'}`;
+  const title = `${spd}${S.est ? '（推定）' : ''}　${lineDisplay(P).main}`;
   let text = '';
   const ahead = P ? stationsAhead(2) : [];
   const here = stationHere();
@@ -1002,7 +1101,7 @@ function stop() {
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 }
 
-/** 模擬走行: ?sim=路線名の一部 [&x=早回し倍率] [&v=最高速度km/h] [&n=位置の誤差m] [&t=種別]
+/** 模擬走行: ?sim=路線名の一部 [&x=早回し倍率] [&v=最高速度km/h] [&n=位置の誤差m] [&t=種別] [&r=1 逆向き]
  *  各駅に停車し、トンネル内では GPS を出さない (推定の動作確認用) */
 function startSim(q) {
   let best = null;
@@ -1016,7 +1115,11 @@ function startSim(q) {
   const SIM_NOISE = Number(params.get('n')) || 4;   // 位置の誤差 [m]
   // t=種別名 で、その種別の停車駅だけに止まる (種別の自動判定の確認用)
   const T = TYPES[lineLabel(P.line)], ty = params.get('t');
-  const stops = T && T.types[ty] ? P.st.filter((st) => typeStops(T, ty, st.n)) : P.st;
+  // r=1 でパスを逆向きに走る。sim.s は走る向きの距離で、パス上の位置は pos(sim.s)
+  const rev = params.get('r') === '1';
+  const pos = (u) => (rev ? P.len - u : u);
+  const stops = (T && T.types[ty] ? P.st.filter((st) => typeStops(T, ty, st.n)) : P.st)
+    .map((st) => ({ ...st, s: pos(st.s) })).sort((a, b) => a.s - b.s);
   const sim = { s: stops[0].s, v: 0, dwell: 15, idx: 1 };
   const dt = 1;   // 模擬時間で 1 秒ごと
   simTimer = setInterval(() => {
@@ -1030,18 +1133,19 @@ function startSim(q) {
       sim.s += sim.v * dt;
       if (sim.s >= target.s) { sim.s = target.s; sim.v = 0; sim.dwell = 20; sim.idx++; }
     }
-    const inTunnel = P.tn.some((tn) => sim.s >= tn.a && sim.s <= tn.b);
+    const ps = pos(sim.s);
+    const inTunnel = P.tn.some((tn) => ps >= tn.a && ps <= tn.b);
     if (inTunnel) return;
     // 屋根のある駅を模す: 停車中は GPS がほぼ入らず、たまに精度の悪い測位がでたらめな速度で届く
     if (SIM_NOISE > 4 && sim.dwell > 0) {
       sim.bad = (sim.bad || 0) + 1;
       if (sim.bad % 8) return;
-      const q = pointAt(P, sim.s);
+      const q = pointAt(P, ps);
       onFix({ lat: q.lat + 30 / R_LAT, lon: q.lon, accuracy: 45, speed: Math.random() * 17, heading: null });
       return;
     }
-    const p = pointAt(P, sim.s);
-    const p2 = pointAt(P, Math.min(P.len, sim.s + 5));
+    const p = pointAt(P, ps);
+    const p2 = pointAt(P, Math.max(0, Math.min(P.len, pos(sim.s + 5))));
     const cl = Math.cos(p.lat * Math.PI / 180);
     const heading = (Math.atan2((p2.lon - p.lon) * cl * R_LON, (p2.lat - p.lat) * R_LAT) * 180 / Math.PI + 360) % 360;
     const noise = () => (Math.random() - 0.5) * 2 * SIM_NOISE / R_LAT;
