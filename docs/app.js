@@ -20,6 +20,7 @@ const SMOOTH_HALF_S = 4;                // なめらかな速度グラフの平�
 const GPS_LOST_MS = 3000;               // これ以上 GPS が来なければ推定に切り替え
 const ACC_LIMIT = 150;                  // これより精度が悪い測位は捨てる [m]
 const A_MAX = 1.5;                      // 速度の変化として許す加減速度 [m/s^2] (列車は通常 1 前後)
+const ISOLATED_ACC = 20;                // 推定中に単発で届いた測位で、これより精度が悪ければ速度を使わない [m]
 const STOP_V = 1.5;                     // これ未満を停止とみなす [m/s]
 const STOP_HOLD_MS = 3000;              // この時間停止が続いたら駅に着いたとみなす
 const STOP_MARGIN = 40;                 // 駅 (ホーム) の範囲からこの距離までは駅とみなす [m] (+ GPS 精度、最大 +100)
@@ -143,6 +144,8 @@ const S = {
   speed: 0,                    // [m/s] (外れ値除去・加減速制限後)
   sVar: 0,                     // s の推定分散 [m^2]
   anchorS: 0,                  // 進行方向を移動量から決めるときの基準位置
+  lastRawAt: 0,                // 最後に測位が届いた時刻 (捨てたものも含む)
+  noClampUntil: 0,             // GPS 復帰直後、この時刻までは加減速の制限をかけない
   fixes: [],                   // 直近 6 秒の測位 (速度の食い違い確認用)
   vRaw: [],                    // 直近の生の速度 (中央値フィルタ用)
   estDecel: 0,                 // 推定中に続ける減速度 [m/s^2]
@@ -187,7 +190,13 @@ function onFix(fix) {
     if (dist > 2 * (accuracy + f0.acc) && vPos > 4 && v < vPos * 0.5) v = vPos;
   }
   const dtPrev = S.lastFixAt ? (t - S.lastFixAt) / 1000 : 0;
-  v = filterSpeed(v, dtPrev);
+  // GPS が途切れている間にぽつんと届く精度の悪い測位 (屋根のある駅など) は速度が当てにならない。
+  // 位置だけ使い、推定は続ける。続けて届いたか精度が良ければ復帰とみなす
+  const isolated = S.est && accuracy > ISOLATED_ACC && t - S.lastRawAt > 2500;
+  S.lastRawAt = t;
+  if (isolated) v = S.speed;
+  else if (S.est) { S.vRaw = []; S.noClampUntil = t + 3000; }   // 復帰: 推定値からなだらかにせず測った速度をそのまま使う
+  if (!isolated) v = filterSpeed(v, dtPrev, t);
   // 予測位置 (推定中は tick が既に進めている)
   const pred = S.est ? S.s : S.s + S.dir * S.speed * dtPrev;
 
@@ -265,6 +274,7 @@ function onFix(fix) {
     S.pi = -1; S.dir = 0; S.alts = [];   // 線路から離れた
   }
   S.speed = v;
+  if (isolated) { updateStop(t); return; }
   S.est = false;
   S.lastFixAt = t;
   S.lastFix = { t, lat, lon };
@@ -281,13 +291,14 @@ function resetAfterGap() {
 }
 
 /** 生の速度から外れ値を除く: 直近 3 点の中央値 → 前回からの変化を加減速度の上限で制限 */
-function filterSpeed(raw, dt) {
+function filterSpeed(raw, dt, t) {
   raw = Math.max(0, raw);
   S.vRaw.push(raw);
   if (S.vRaw.length > 3) S.vRaw.shift();
   if (dt > 10) S.vRaw = [raw];               // 長く途切れた後は過去を使わない
   const med = [...S.vRaw].sort((a, b) => a - b)[Math.floor(S.vRaw.length / 2)];
-  if (S.est || !S.lastFixAt || dt > 10) return med;   // 推定中の速度は当てにならないので制限しない
+  // 推定中・復帰直後は直前の速度が当てにならないので、加減速の制限をかけない
+  if (S.est || !S.lastFixAt || dt > 10 || t < S.noClampUntil) return med < 0.3 ? 0 : med;
   const lim = A_MAX * dt + 0.5;
   const v = Math.max(S.speed - lim, Math.min(S.speed + lim, med));
   return v < 0.3 ? 0 : v;
@@ -763,6 +774,14 @@ function startSim(q) {
     }
     const inTunnel = P.tn.some((tn) => sim.s >= tn.a && sim.s <= tn.b);
     if (inTunnel) return;
+    // 屋根のある駅を模す: 停車中は GPS がほぼ入らず、たまに精度の悪い測位がでたらめな速度で届く
+    if (SIM_NOISE > 4 && sim.dwell > 0) {
+      sim.bad = (sim.bad || 0) + 1;
+      if (sim.bad % 8) return;
+      const q = pointAt(P, sim.s);
+      onFix({ lat: q.lat + 30 / R_LAT, lon: q.lon, accuracy: 45, speed: Math.random() * 17, heading: null });
+      return;
+    }
     const p = pointAt(P, sim.s);
     const p2 = pointAt(P, Math.min(P.len, sim.s + 5));
     const cl = Math.cos(p.lat * Math.PI / 180);
