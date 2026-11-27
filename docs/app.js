@@ -208,7 +208,8 @@ function pointAt(P, s) {
 // ------------------------------------------------------------ 状態
 const S = {
   running: false,
-  pi: -1, s: 0, dir: 0,        // パス, パス上の位置 [m], 進行方向 (+1 / -1 / 0=未定)
+  stopOv: new Map(),           // この乗車だけの停車 (true) / 通過 (false) の手の指定。駅名 → 真偽。「停止」で消す
+  pi: -1, s: 0, dir: 0,       // パス, パス上の位置 [m], 進行方向 (+1 / -1 / 0=未定)
   speed: 0,                    // [m/s] (外れ値除去・加減速制限後)
   sVar: 0,                     // s の推定分散 [m^2]
   anchorS: 0,                  // 進行方向を移動量から決めるときの基準位置
@@ -457,6 +458,7 @@ function currentType(T) {
 
 /** その駅に止まるか (種別が決まっていなければ、候補のどれかが止まれば止まる扱い) */
 function stopsAt(name) {
+  if (S.stopOv.has(name)) return S.stopOv.get(name);   // 手で決めた駅は種別より優先
   const T = lineTypes();
   if (!T) return true;
   const ty = currentType(T);
@@ -468,6 +470,7 @@ function stopsAt(name) {
 function typeEvidence(name, stopped) {
   const T = lineTypes();
   if (!T || !S.typeCands) return;
+  if (S.stopOv.has(name)) return;   // 手で決めた駅 (種別と違う停まり方をする列車) は種別の判定に使わない
   if (!Object.values(T.types).some((v) => v === 'all' || v.includes(name)) && !stopped) return;
   const next = S.typeCands.filter((c) => typeStops(T, c, name) === stopped);
   // どれにも当てはまらない (臨時停車・データの誤りなど) ときは候補を全部に戻す
@@ -592,8 +595,9 @@ function stationsAheadAll(n) {
       prev = p;
       if (names.has(nm) || nm === rc.endName) continue;
       names.add(nm);
-      out.push({ n: nm, dist: off, stop: true, other: lab });
-      stops++;
+      const stop = S.stopOv.get(nm) !== false;   // 系統の停車駅だが手で通過にした駅は通過
+      out.push({ n: nm, dist: off, stop, other: lab });
+      if (stop) stops++;
     }
     return out;
   }
@@ -1136,6 +1140,7 @@ function stop() {
   logFlush();
   LOG.sess = 0;
   S.running = false;
+  S.stopOv.clear();   // 停車駅の手の指定はこの乗車だけ
   $('startBtn').textContent = '開始';
   if (watchId != null) navigator.geolocation.clearWatch(watchId);
   watchId = null;
@@ -1479,6 +1484,38 @@ $('tedStations').addEventListener('click', (e) => {
   tedRender();
 });
 $('tedFilter').addEventListener('input', tedLineOptions);
+
+// ------------------------------------------------------------ この列車の停車駅 (次駅カードから)
+// 同じ種別でも列車ごとに停車駅が違う (はやぶさ など) ので、この乗車だけ駅ごとに停車・通過を決められるようにする
+const SED_MAX = 40;   // 一覧に出す停車駅の数
+let sedList = [];
+function sedRender() {
+  sedList = stationsAheadAll(SED_MAX);
+  const T = lineTypes(), ty = currentType(T);
+  $('sedHint').textContent = !sedList.length ? '進行方向が決まると、先の駅が並びます'
+    : `駅をタップで 停車 ⇔ 通過（この乗車だけ。「停止」で消える）。もとの停車駅: ${ty ? typeShort(T, ty) : T ? '種別未定 (候補のどれかが止まる駅)' : '全駅'}`;
+  $('sedStations').innerHTML = sedList.map((a, i) => {
+    const ov = S.stopOv.has(a.n);
+    return `<li data-i="${i}" class="${a.stop ? 'stop' : 'pass'}${ov ? ' ov' : ''}"><span class="dot"></span>` +
+      `<span class="nm">${esc(a.n)}</span><span class="tag">${fmtDist(a.dist)}　${a.stop ? '停車' : '通過'}${ov ? '（手）' : ''}</span></li>`;
+  }).join('');
+  $('sedClear').disabled = !S.stopOv.size;
+}
+$('nextCard').addEventListener('click', () => { sedRender(); $('stopEd').showModal(); });
+$('sedStations').addEventListener('click', (e) => {
+  const li = e.target.closest('li');
+  if (!li) return;
+  const a = sedList[Number(li.dataset.i)];
+  if (!a) return;
+  S.stopOv.delete(a.n);
+  // 指定を外したときの停まり方 (種別どおり) と同じになるなら、手の指定は持たない
+  if (stopsAt(a.n) === a.stop) S.stopOv.set(a.n, !a.stop);
+  logEvent('stopOv', a.n, S.stopOv.has(a.n) ? (S.stopOv.get(a.n) ? '停車にする' : '通過にする') : '指定を外す');
+  sedRender();
+  render();
+});
+$('sedClear').onclick = () => { S.stopOv.clear(); sedRender(); render(); };
+$('sedClose').onclick = () => $('stopEd').close();
 $('tedLine').addEventListener('change', () => { TED.line = $('tedLine').value; TED.sel = null; tedRender(); });
 $('tedName').addEventListener('change', () => {
   const D = tedData(TED.line);

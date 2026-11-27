@@ -34,8 +34,8 @@
     <div class="chart-legend"><span><i class="raw"></i>測位ごと</span><span><i class="smooth"></i>なめらか（約4秒遅れ）</span></div>
   </section>
 
-  <section class="card">
-    <div class="card-head"><span>次駅</span><span id="dirLabel" class="muted"></span></div>
+  <section class="card tappable" id="nextCard" title="タップで停車駅を変更">
+    <div class="card-head"><span>次駅 <span class="muted">（タップで停車駅を変更）</span></span><span id="dirLabel" class="muted"></span></div>
     <div class="next">
       <div id="nextName" class="next-name">--</div>
       <div class="next-nums">
@@ -127,6 +127,16 @@
     <button type="button" id="tedReset">初期値に戻す</button>
     <button type="button" id="tedCancel">閉じる</button>
     <button type="button" id="tedSave" class="primary">保存</button>
+  </div>
+</dialog>
+
+<dialog id="stopEd" class="ted">
+  <h2>この列車の停車駅</h2>
+  <p id="sedHint" class="muted"></p>
+  <ol id="sedStations" class="route"></ol>
+  <div class="dlg-btns">
+    <button type="button" id="sedClear">手の指定を消す</button>
+    <button type="button" id="sedClose" class="primary">閉じる</button>
   </div>
 </dialog>
 

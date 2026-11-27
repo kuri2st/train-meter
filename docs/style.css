@@ -120,6 +120,9 @@ dialog.ted { width: min(520px, calc(100vw - 24px)); max-height: calc(100vh - 24p
 .route li.pass .dot { background: var(--card); border: 2px solid #6b7680; width: 12px; height: 12px; margin: 0 3px 0 5px; }
 .route li.none .dot { background: #5b6875; width: 12px; height: 12px; margin: 0 3px 0 5px; }
 .route .nm { flex: 1; }
+.route li.ov .tag { color: var(--est); }
+.card.tappable { cursor: pointer; }
+.card.tappable:active { filter: brightness(1.15); }
 .route li.pass .nm { color: #6b7680; }
 .route .tag { font-size: 0.8rem; color: var(--muted); }
 .route li.stop .tag { color: var(--accent); }
