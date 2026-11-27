@@ -15,6 +15,8 @@
 const R_LAT = 110574, R_LON = 111320;   // 1 度あたりの距離 [m] (build_data.py と同じ)
 const CELL = 0.01;                      // 空間索引の格子 [度]
 const DECEL = 0.7;                      // 到着予想で使う減速度 [m/s^2]
+const ACCEL = 0.6;                      // 到着予想で使う加速度 [m/s^2]
+const SMOOTH_HALF_S = 4;                // なめらかな速度グラフの平均幅 (前後この秒数、表示はこの分遅れる)
 const GPS_LOST_MS = 3000;               // これ以上 GPS が来なければ推定に切り替え
 const ACC_LIMIT = 150;                  // これより精度が悪い測位は捨てる [m]
 const A_MAX = 1.5;                      // 速度の変化として許す加減速度 [m/s^2] (列車は通常 1 前後)
@@ -382,22 +384,30 @@ function stationHere() {
   return S.stopSt && S.stopSt.pi === S.pi ? S.stopSt : null;
 }
 
-/** 巡航速度: 現在速度と直近 5 分の走行中平均の大きい方 */
+/** 巡航速度: 直近 5 分の走行中 (10 km/h 超) の速度の上位 15% 点と現在速度の大きい方。
+ *  平均にすると停車前後の加減速の遅い区間に引きずられて遅めに出るので、上位の値を使う */
 function cruiseSpeed() {
   const t = now();
-  const vs = S.hist.filter((h) => h.t > t - 300000 && h.v > 3).map((h) => h.v);
-  const avg = vs.length ? vs.reduce((a, b) => a + b, 0) / vs.length : 0;
-  return Math.max(S.speed, avg);
+  const vs = S.hist.filter((h) => h.t > t - 300000 && h.v > 3).map((h) => h.v).sort((a, b) => a - b);
+  const hi = vs.length ? vs[Math.floor(vs.length * 0.85)] : 0;
+  return Math.max(S.speed, hi);
 }
 
-/** 距離 D [m] を巡航→一定減速で停止するとしたときの所要時間 [s] */
+/** 距離 D [m] を、今の速度 → 巡航速度まで加速 → 巡航 → 一定減速で停止、としたときの所要時間 [s] */
 function etaSec(D) {
-  const v = cruiseSpeed();
-  if (v < 1) return null;
-  const brake = v * v / (2 * DECEL);
-  const start = S.speed < STOP_V ? v / (2 * DECEL) : 0;   // 停車中は加速にかかる分を足す
-  return (D > brake ? (D - brake) / v + v / DECEL : Math.sqrt(2 * D / DECEL)) + start;
+  const vc = cruiseSpeed();
+  if (vc < 1) return null;
+  const v0 = Math.min(S.speed, vc);
+  const da = (vc * vc - v0 * v0) / (2 * ACCEL), db = vc * vc / (2 * DECEL);
+  if (da + db <= D) return (vc - v0) / ACCEL + (D - da - db) / vc + vc / DECEL;
+  // 巡航速度に届かない: 加速して最高 vp に達したらすぐ減速
+  const vp = Math.sqrt((D + v0 * v0 / (2 * ACCEL)) / (1 / (2 * ACCEL) + 1 / (2 * DECEL)));
+  if (vp <= v0) return v0 > 0 ? 2 * D / v0 : null;    // もう減速中
+  return (vp - v0) / ACCEL + vp / DECEL;
 }
+
+/** 停車中か (到着予想を時刻ではなく「発車後 約 X 分」で出す) */
+const isStopped = () => S.speed < STOP_V;
 
 function tunnelInfo(nextDist) {
   const P = PATHS[S.pi];
@@ -431,6 +441,7 @@ const fmtDur = (s) => s >= 3600 ? `${Math.floor(s / 3600)}時間${Math.round(s %
 
 function render() {
   const t = now();
+  $('clock').textContent = fmtClock(t);
   // 速度
   const speedSec = $('speed').parentElement.parentElement;
   speedSec.classList.toggle('est', S.est);
@@ -459,16 +470,17 @@ function render() {
     $('nextDist').textContent = fmtDist(nx.dist);
     $('nextDist').className = 'big ' + estCls;
     const e = etaSec(nx.dist);
-    $('nextEta').textContent = e == null ? '--' : `${fmtClock(t + e * 1000)}（${fmtDur(e)}）`;
+    // 停車中はいつ発車するか分からないので、時刻ではなく発車後の所要時間を出す
+    $('nextEta').textContent = e == null ? '--'
+      : isStopped() ? `発車後 約${fmtDur(e)}` : `${fmtClock(t + e * 1000)}（${fmtDur(e)}）`;
   } else {
     $('nextName').textContent = '--';
     $('nextDist').textContent = '--';
     $('nextEta').textContent = '--';
   }
-  $('following').innerHTML = ahead.slice(1).map((a) => {
-    const e = etaSec(a.dist);
-    return `<li><span>${esc(a.n)}</span><span>${fmtDist(a.dist)}　${e == null ? '--' : fmtClock(t + e * 1000)}</span></li>`;
-  }).join('');
+  // 2 つ先以降は途中で停車するかもしれないので距離だけ
+  $('following').innerHTML = ahead.slice(1).map((a) =>
+    `<li><span>${esc(a.n)}</span><span>${fmtDist(a.dist)}</span></li>`).join('');
 
   // トンネル
   const ti = tunnelInfo(ahead.length ? ahead[0].dist : null);
@@ -502,7 +514,8 @@ function updateNotification(t) {
   if (here) text += `${here.n} 停車中　`;
   if (ahead.length) {
     const e = etaSec(ahead[0].dist);
-    text += `次は ${ahead[0].n} ${fmtDist(ahead[0].dist)}` + (e == null ? '' : `（${fmtClock(t + e * 1000).slice(0, 5)} 着予想）`);
+    text += `次は ${ahead[0].n} ${fmtDist(ahead[0].dist)}` + (e == null ? ''
+      : isStopped() ? `（発車後 約${fmtDur(e)}）` : `（${fmtClock(t + e * 1000).slice(0, 5)} 着予想）`);
     if (ahead[1]) text += `\nその次 ${ahead[1].n} ${fmtDist(ahead[1].dist)}`;
   } else if (P) text += S.dir === 0 ? '進行方向を判定中' : '';
   const key = title + text;
@@ -560,15 +573,47 @@ function drawChart(t) {
     const lab = frac === 1 ? '現在' : `-${Math.round(sec * (1 - frac))}s`;
     ctx.fillText(lab, L + (w - L - R) * frac, h - 4);
   }
-  ctx.lineWidth = 2;
+  // 測位ごとの速度 (細く薄く)
+  ctx.lineWidth = 1.2;
   for (let i = 1; i < pts.length; i++) {
     const a = pts[i - 1], b = pts[i];
     if (b.t - a.t > 30000) continue;   // 長い空白はつながない
-    ctx.strokeStyle = b.est ? '#ffb74d' : '#4fc3f7';
+    ctx.strokeStyle = b.est ? 'rgba(255,183,77,0.6)' : 'rgba(79,195,247,0.45)';
     ctx.setLineDash(b.est ? [4, 3] : []);
     ctx.beginPath(); ctx.moveTo(X(a.t), Y(a.v * 3.6)); ctx.lineTo(X(b.t), Y(b.v * 3.6)); ctx.stroke();
   }
   ctx.setLineDash([]);
+  // なめらかな速度 (太く)
+  const sm = smoothHist(pts);
+  ctx.lineWidth = 2.5; ctx.lineJoin = 'round';
+  for (let i = 1; i < sm.length; i++) {
+    const a = sm[i - 1], b = sm[i];
+    if (b.t - a.t > 30000) continue;
+    ctx.strokeStyle = b.est ? '#ffb74d' : '#e8edf2';
+    ctx.beginPath(); ctx.moveTo(X(a.t), Y(a.v * 3.6)); ctx.lineTo(X(b.t), Y(b.v * 3.6)); ctx.stroke();
+  }
+}
+
+/** 速度履歴を前後 SMOOTH_HALF_S 秒のガウス重みで平均する。
+ *  後ろ側のデータがそろった点だけを返すので、最新から SMOOTH_HALF_S 秒遅れる */
+function smoothHist(pts) {
+  const H = SMOOTH_HALF_S * 1000, sig = H / 2;
+  const out = [];
+  if (!pts.length) return out;
+  const tEnd = pts[pts.length - 1].t;
+  let lo = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const ti = pts[i].t;
+    if (ti > tEnd - H) break;
+    while (pts[lo].t < ti - H) lo++;
+    let sw = 0, sv = 0;
+    for (let j = lo; j < pts.length && pts[j].t <= ti + H; j++) {
+      const w = Math.exp(-0.5 * ((pts[j].t - ti) / sig) ** 2);
+      sw += w; sv += w * pts[j].v;
+    }
+    out.push({ t: ti, v: sv / sw, est: pts[i].est });
+  }
+  return out;
 }
 
 /** 進行方向を右にした直線の路線図 (駅・トンネル・現在位置) */

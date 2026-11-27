@@ -12,7 +12,10 @@
 <body>
 <main id="app">
   <section class="line">
-    <div id="lineName" class="line-name">路線未判定</div>
+    <div class="line-head">
+      <div id="lineName" class="line-name">路線未判定</div>
+      <div id="clock" class="clock">--:--:--</div>
+    </div>
     <div id="lineAlts" class="chips"></div>
   </section>
 
@@ -24,6 +27,7 @@
   <section class="card chart-card">
     <div class="card-head"><span>速度履歴</span><span id="histLabel" class="muted"></span></div>
     <canvas id="chart"></canvas>
+    <div class="chart-legend"><span><i class="raw"></i>測位ごと</span><span><i class="smooth"></i>なめらか（約4秒遅れ）</span></div>
   </section>
 
   <section class="card">
