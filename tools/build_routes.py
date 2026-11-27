@@ -7,6 +7,7 @@
   raw/N02-24/**/N02-24_Station.geojson
   tools/types_manual.json          手作りの種別と停車駅
   tools/route_joins.json           直通の対応表 (OSM では別の route になっている直通運転をつなぐ)
+  tools/routes_manual.json         手作りの系統 (OSM に無いもの)。停車駅の並びを駅名で書く
 出力:
   docs/data/types.json             路線 (会社 路線名) ごとの種別と停車駅。
                                    手作りがある路線は手作りを残し、OSM のうちほかの路線へ乗り入れる系統だけを後ろに足す
@@ -36,6 +37,7 @@ ROOT = bd.ROOT
 ROUTE_DIR = os.path.join(bd.RAW, "osm_routes")
 MANUAL = os.path.join(ROOT, "tools", "types_manual.json")
 JOINS = os.path.join(ROOT, "tools", "route_joins.json")
+ROUTES_MANUAL = os.path.join(ROOT, "tools", "routes_manual.json")
 OUT_TYPES = os.path.join(ROOT, "docs", "data", "types.json")
 OUT_ROUTES = os.path.join(ROOT, "docs", "data", "routes.json")
 
@@ -163,6 +165,22 @@ def main():
             longest = max(seqs, key=lambda s: (len({lab for lab, _ in s}), len(s)))
             labels[label] = (per_line, [tuple(x) for x in longest])
 
+    # 手作りの系統 (OSM に無いもの。湘南新宿ラインの特別快速など)
+    with open(ROUTES_MANUAL, encoding="utf-8") as f:
+        rman = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
+    for label, names in rman.items():
+        seq = resolve_names(names, recs, xy)
+        if len(seq) < 2:
+            print(f"  手作りの系統 {label}: 駅が見つからない")
+            continue
+        per_line = defaultdict(set)
+        for lab, nm in seq:
+            per_line[lab].add(nm)
+        labels[label] = (per_line, seq)
+        found = {nm for _, nm in seq}
+        miss = [n for n in names if kana_key(n) not in {kana_key(x) for x in found}]
+        print(f"  手作りの系統 {label}: {len(names)} 駅 → 路線 {sorted(per_line)}" + (f" 見つからない駅 {miss}" if miss else ""))
+
     # 直通の対応表 (OSM では別の route になっている直通運転をつなぐ)
     with open(JOINS, encoding="utf-8") as f:
         joins = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
@@ -199,12 +217,15 @@ def main():
             g["order"].append(label)
             g["types"][label] = "all" if names >= line_all[lab] else sorted(names)
 
-    # 種別の並び: 止まる駅が多い順 (各駅停車が先、特急が後)
+    # 種別の並び: 特急は後ろ、ほかは止まる駅が多い順 (各駅停車が先)。どれが特急かもアプリに渡す
     for lab, g in gen.items():
         def nstop(ty):
             v = g["types"][ty]
             return len(line_all[lab]) if v == "all" else len(v)
-        g["order"].sort(key=lambda ty: (-nstop(ty), ty))
+        g["order"].sort(key=lambda ty: (is_express(ty), -nstop(ty), ty))
+        ex = [ty for ty in g["order"] if is_express(ty)]
+        if ex:
+            g["express"] = ex
         # 駅名の並びを路線の駅の並び (国土数値情報) に合わせる必要はない (アプリは含まれるかだけ見る)
 
     out = dict(manual)
@@ -216,6 +237,9 @@ def main():
             m = manual[lab]
             add = [ty for ty in g["order"] if ty not in m["types"]]
             out[lab] = {**m, "order": m["order"] + add, "types": {**m["types"], **{ty: g["types"][ty] for ty in add}}}
+            ex = [ty for ty in add if is_express(ty)]
+            if ex:
+                out[lab]["express"] = ex
         else:
             out[lab] = g
     with open(OUT_TYPES, "w", encoding="utf-8") as f:
@@ -224,6 +248,77 @@ def main():
         json.dump(routes, f, ensure_ascii=False, separators=(",", ":"))
     print(f"出力: 種別のある路線 {len(out) - 1} (OSM {len(gen)}, 手作りに乗り入れ系統を追加 {len(replaced)}: {replaced})")
     print(f"  {OUT_TYPES} ({os.path.getsize(OUT_TYPES) / 1e3:.0f} kB), {OUT_ROUTES} ({os.path.getsize(OUT_ROUTES) / 1e3:.0f} kB)")
+
+
+def kana_key(name):
+    """駅名の比較用 (「ヶ」「ケ」「が」の書き分けを区別しない)"""
+    return name.replace("ヶ", "ケ").replace("ケ", "ケ")
+
+
+def resolve_names(names, recs, xy):
+    """駅名の並び → [(路線, 駅名)]。同じ駅名の駅が各地にあるので、隣の駅との距離が短く、
+    路線の乗り換えが少ない並びを選ぶ。乗り換え駅は両方の路線の駅として入れる"""
+    by_name = defaultdict(list)
+    for i, r in enumerate(recs):
+        by_name[kana_key(r[1])].append(i)
+    cand = [by_name.get(kana_key(n), []) for n in names]
+    cand = [c for c in cand if c]
+    if not cand:
+        return []
+    INF = 1e18
+    cost = [{i: 0.0 for i in cand[0]}]
+    back = [{}]
+    for k in range(1, len(cand)):
+        cur, bk = {}, {}
+        for j in cand[k]:
+            best, arg = INF, None
+            for i, pc in cost[-1].items():
+                d_km = float(np.hypot(*(xy[i] - xy[j]))) / 1000
+                v = pc + (0 if recs[i][0] == recs[j][0] else 1.0) + d_km / 3
+                if v < best:
+                    best, arg = v, i
+            cur[j], bk[j] = best, arg
+        cost.append(cur)
+        back.append(bk)
+    j = min(cost[-1], key=cost[-1].get)
+    path = [j]
+    for k in range(len(cand) - 1, 0, -1):
+        j = back[k][j]
+        path.append(j)
+    path.reverse()
+    seq = []
+    for k, i in enumerate(path):
+        lab, nm = recs[i][0], recs[i][1]
+        if k > 0 and recs[path[k - 1]][0] != lab:
+            # 乗り換え: 前の駅が新しい路線にもあれば (同じ場所に) 新しい路線の駅としても入れる
+            p = path[k - 1]
+            for q in by_name[kana_key(recs[p][1])]:
+                if recs[q][0] == lab and np.hypot(*(xy[q] - xy[p])) < MATCH_M:
+                    seq.append((lab, recs[q][1]))
+                    break
+        seq.append((lab, nm))
+        if k + 1 < len(path) and recs[path[k + 1]][0] != lab:
+            n = path[k + 1]
+            for q in by_name[kana_key(recs[n][1])]:
+                if recs[q][0] == lab and np.hypot(*(xy[q] - xy[n])) < MATCH_M:
+                    seq.append((lab, recs[q][1]))
+                    break
+    out = []
+    for e in seq:
+        if not out or out[-1] != e:
+            out.append(e)
+    return out
+
+
+def is_express(label):
+    """特急らしい系統か。OSM の route には特急を示すタグがほとんど無いので名前で判断する:
+    「特急」を含むか、「線」「ライン」「Line」を含まず種別名 (急行・快速 など) でも終わらない名前
+    (ひたち・あずさ・踊り子・つばさ列車・成田エクスプレス など)"""
+    if "特急" in label:
+        return True
+    if any(w in label for w in ("線", "ライン", "Line", "line")):
+        return False
+    return not any(label.endswith(w) for w in TYPE_WORDS)
 
 
 def join_seq(a, b):

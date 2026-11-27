@@ -27,6 +27,7 @@ GPS が途切れた (トンネル内など) ときは、直前の速度のまま
 | `tools/build_routes.py` | OSM の運転系統 (route) から `types.json` と `routes.json` を作る |
 | `tools/types_manual.json` | 手作りの種別と停車駅 (小田急など)。手作りがある路線は手作りを残し、OSM からはほかの路線へ乗り入れる系統だけを足す |
 | `tools/route_joins.json` | 直通の対応表。OSM で別の route になっている直通運転 (京浜東北線 + 根岸線) をつなぐ |
+| `tools/routes_manual.json` | 手作りの運転系統。OSM に無い系統 (湘南新宿ラインの快速・特別快速) を停車駅の並びで書く |
 | `tools/fetch_raw.py` | 元データの取得 (国土数値情報 N02-24、OSM の鉄道トンネル) |
 | `tools/build_data.py` | 元データを `rail.json` に加工 |
 | `raw/` | 元データ (git 管理外) |
@@ -37,7 +38,7 @@ GPS が途切れた (トンネル内など) ときは、直前の速度のまま
 ## データの作り直し
 
 Spyder で `tools/fetch_raw.py` → `tools/build_data.py` → `tools/build_routes.py` の順に実行する。
-手作りの種別 (`tools/types_manual.json`) や直通の対応表 (`tools/route_joins.json`) を直したときは `build_routes.py` だけでよい。
+手作りの種別 (`tools/types_manual.json`)、直通の対応表 (`tools/route_joins.json`)、手作りの系統 (`tools/routes_manual.json`) を直したときは `build_routes.py` だけでよい。
 アプリやデータを更新したら `docs/sw.js` の `VERSION` を上げる (端末のキャッシュを更新させるため)。
 
 ## Android アプリのビルド

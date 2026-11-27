@@ -16,7 +16,8 @@ const R_LAT = 110574, R_LON = 111320;   // 1 度あたりの距離 [m] (build_da
 const CELL = 0.01;                      // 空間索引の格子 [度]
 const DECEL = 0.7;                      // 到着予想で使う減速度 [m/s^2]
 const ACCEL = 0.6;                      // 到着予想で使う加速度 [m/s^2]
-const SMOOTH_HALF_S = 4;                // なめらかな速度グラフの平均幅 (前後この秒数、表示はこの分遅れる)
+const TYPE_BUTTONS_MAX = 5;             // 種別がこれより多い路線はボタンではなくプルダウン
+const SMOOTH_HALF_S = 4;               // なめらかな速度グラフの平均幅 (前後この秒数、表示はこの分遅れる)
 const GPS_LOST_MS = 3000;               // これ以上 GPS が来なければ推定に切り替え
 const ACC_LIMIT = 150;                  // これより精度が悪い測位は捨てる [m]
 const A_MAX = 1.5;                      // 速度の変化として許す加減速度 [m/s^2] (列車は通常 1 前後)
@@ -126,7 +127,17 @@ async function loadData() {
   });
 }
 
-const lineLabel = (li) => `${LINES[li].c} ${LINES[li].n}`;
+const lineLabel = (li) => `${LINES[li].c} ${LINES[li].n}`;   // データ (種別・系統・保存した設定) のキー
+
+// 表示用の路線名。国土数値情報は JR の本線を「東海道線」「東北線」のように「本」を付けずに書くので、
+// 正式名が「○○本線」のものは本線にして表示する (キーは国土数値情報の名前のまま)
+const HONSEN = new Set(['函館', '室蘭', '根室', '宗谷', '石北', '釧網', '留萌', '日高', '東北', '奥羽', '羽越', '総武',
+  '中央', '信越', '北陸', '東海道', '関西', '紀勢', '山陽', '山陰', '鹿児島', '日豊', '長崎', '筑豊', '久大', '豊肥']);
+function showLabel(label) {
+  const m = /^(JR\S+) (.+)線$/.exec(label);
+  return m && HONSEN.has(m[2]) ? `${m[1]} ${m[2]}本線` : label;
+}
+const lineShow = (li) => showLabel(lineLabel(li));
 
 // 運転系統: 種別名 → 停車駅の並び [[路線, 駅名], ...] (data/routes.json、OSM から作成)
 let ROUTES = {};
@@ -151,7 +162,7 @@ function routeLines(name) {
 function lineDisplay(P) {
   if (!P) return { main: S.running ? '線路の近くにいません' : '路線未判定', sub: '' };
   const r = currentRoute();
-  return r ? { main: r, sub: lineLabel(P.line) } : { main: lineLabel(P.line), sub: '' };
+  return r ? { main: r, sub: lineShow(P.line) } : { main: lineShow(P.line), sub: '' };
 }
 
 /** 点の近くにあるパスを探し、パスごとに最も近い投影を返す */
@@ -212,6 +223,7 @@ const S = {
   typeSel: null,               // 手動で選んだ種別 (null = 自動)
   typeCands: null,             // 自動判定: まだ可能性のある種別の配列
   passCheck: null,             // 駅を通過したか調べるための直前の位置 {pi, s}
+  passOutside: false,          // 直前の位置が駅の範囲の外だったか (範囲に外から入るのを見たときだけ通過を判定する)
   afterGap: false,             // バックグラウンドから戻った直後 (次の測位で位置を取り直す)
   hiddenAt: 0,
   acc: null,
@@ -360,7 +372,7 @@ function onFix(fix) {
 /** ブラウザでバックグラウンドから戻ったとき: 離れていた間の推定は当てにならないので測位からやり直す */
 function resetAfterGap() {
   S.lastFixAt = 0; S.lastFix = null; S.est = false;
-  S.vRaw = []; S.fixes = []; S.stopSt = null; S.slowSince = 0;
+  S.vRaw = []; S.fixes = []; S.stopSt = null; S.slowSince = 0; S.passCheck = null; S.passOutside = false;
   S.afterGap = true;
   logEvent('gap', '', 'バックグラウンドから復帰');
 }
@@ -436,7 +448,11 @@ const typeShort = (T, ty) => (T.short && T.short[ty]) || ty;
 function currentType(T) {
   if (!T) return null;
   if (S.typeSel) return S.typeSel;
-  return S.typeCands.length === 1 ? S.typeCands[0] : null;
+  if (S.typeCands.length === 1) return S.typeCands[0];
+  // 特急は優先度を下げる: 特急以外の候補が 1 つだけ残っていればそれにする
+  const ex = new Set(T.express || []);
+  const normal = S.typeCands.filter((c) => !ex.has(c));
+  return normal.length === 1 ? normal[0] : null;
 }
 
 /** その駅に止まるか (種別が決まっていなければ、候補のどれかが止まれば止まる扱い) */
@@ -471,16 +487,18 @@ function checkPassing(P, v) {
   if (pc && (pc.pi !== S.pi || pc.n !== (inside && inside.n))) {
     // 範囲を出た: 進行方向の先へ抜け、ずっと速く、推定も挟まず、そこで停車もしていなければ通過
     const ahead = (S.s - pc.s) * S.dir > 0;
-    if (pc.pi === S.pi && ahead && pc.minV > PASS_V && !pc.est && !(S.stopSt && S.stopSt.n === pc.n)) {
+    // 駅の範囲に外から入るところを見ていない (範囲の中で測位を始めた) ときは、止まったかどうか分からないので使わない
+    if (pc.pi === S.pi && ahead && pc.fromOutside && pc.minV > PASS_V && !pc.est && !(S.stopSt && S.stopSt.n === pc.n)) {
       typeEvidence(pc.n, false);
       logEvent('pass', pc.n, `最低 ${Math.round(pc.minV * 3.6)} km/h`);
     }
     S.passCheck = null;
   }
   if (inside) {
-    if (!S.passCheck) S.passCheck = { pi: S.pi, n: inside.n, s: inside.s, minV: v, est: false };
+    if (!S.passCheck) S.passCheck = { pi: S.pi, n: inside.n, s: inside.s, minV: v, est: false, fromOutside: S.passOutside };
     else S.passCheck.minV = Math.min(S.passCheck.minV, v);
   }
+  S.passOutside = !inside;   // 直前の位置が駅の範囲の外だったか
 }
 
 /** 現在位置が駅とみなす範囲からどれだけ外れているか [m] (0 以下なら範囲内)
@@ -874,18 +892,47 @@ function renderTypes() {
     return;
   }
   const auto = document.createElement('button');
-  const guess = S.typeCands.length === 1 ? typeShort(T, S.typeCands[0])
-    : S.typeCands.length < T.order.length ? S.typeCands.map((c) => typeShort(T, c)).join('/') + '?' : '判定中';
+  const cur = currentType(T);
+  const ex = new Set(T.express || []);
+  // 判定中の候補は特急以外を先に、多いときは件数だけ
+  const cands = [...S.typeCands].sort((a, b) => ex.has(a) - ex.has(b));
+  const guess = cur ? typeShort(T, cur)
+    : S.typeCands.length < T.order.length && S.typeCands.length <= 3 ? cands.map((c) => typeShort(T, c)).join('/') + '?'
+    : S.typeCands.length < T.order.length ? `候補 ${S.typeCands.length}` : '判定中';
   auto.textContent = `自動: ${guess}`;
   if (!S.typeSel) auto.classList.add('on');
   auto.onclick = () => { S.typeSel = null; box.dataset.k = ''; };
   box.appendChild(auto);
-  for (const ty of T.order) {
-    const b = document.createElement('button');
-    b.textContent = typeShort(T, ty);
-    if (S.typeSel === ty) b.classList.add('on');
-    b.onclick = () => { S.typeSel = ty; box.dataset.k = ''; logEvent('type', '', `手動で ${ty}`); };
-    box.appendChild(b);
+  const pick = (ty) => { S.typeSel = ty; box.dataset.k = ''; logEvent('type', '', `手動で ${ty}`); };
+  if (T.order.length > TYPE_BUTTONS_MAX) {
+    // 種別が多い路線はプルダウン (特急はまとめて後ろに)
+    const sel = document.createElement('select');
+    sel.className = 'type-select' + (S.typeSel ? ' on' : '');
+    const head = new Option(S.typeSel ? '' : '種別を選ぶ…', '');
+    if (!S.typeSel) { head.disabled = true; head.selected = true; sel.add(head); }
+    const normal = T.order.filter((ty) => !ex.has(ty)), express = T.order.filter((ty) => ex.has(ty));
+    const add = (parent, ty) => {
+      const o = new Option(typeShort(T, ty), ty);
+      o.selected = S.typeSel === ty;
+      parent.appendChild(o);
+    };
+    for (const ty of normal) add(sel, ty);
+    if (express.length) {
+      const g = document.createElement('optgroup');
+      g.label = '特急など';
+      for (const ty of express) add(g, ty);
+      sel.appendChild(g);
+    }
+    sel.onchange = () => sel.value && pick(sel.value);
+    box.appendChild(sel);
+  } else {
+    for (const ty of T.order) {
+      const b = document.createElement('button');
+      b.textContent = typeShort(T, ty);
+      if (S.typeSel === ty) b.classList.add('on');
+      b.onclick = () => pick(ty);
+      box.appendChild(b);
+    }
   }
   const ed = document.createElement('button');
   ed.textContent = '✎';
@@ -902,7 +949,7 @@ function renderAlts(P) {
   box.innerHTML = '';
   for (const li of S.alts) {
     const b = document.createElement('button');
-    b.textContent = lineLabel(li);
+    b.textContent = lineShow(li);
     if (li === S.pinnedLine || (S.pinnedLine == null && P && P.line === li)) b.classList.add('on');
     b.onclick = () => { S.pinnedLine = li; S.pinnedSeen = now(); box.dataset.k = ''; };
     box.appendChild(b);
@@ -1107,7 +1154,7 @@ function startSim(q) {
   let best = null;
   PATHS.forEach((P, pi) => {
     const nm = lineLabel(P.line);
-    if (nm.includes(q) && P.st.length >= 2 && (!best || P.len > PATHS[best].len)) best = pi;
+    if ((nm.includes(q) || showLabel(nm).includes(q)) && P.st.length >= 2 && (!best || P.len > PATHS[best].len)) best = pi;
   });
   if (best == null) { alert(`模擬走行: 「${q}」を含む路線が見つかりません`); return; }
   const P = PATHS[best];
@@ -1371,11 +1418,11 @@ function openTypeEditor() {
 function tedLineOptions() {
   const q = $('tedFilter').value.trim();
   const labels = [...new Set(PATHS.filter((P) => P.st.length >= 2).map((P) => lineLabel(P.line)))]
-    .filter((l) => !q || l.includes(q) || l === TED.line)
-    .sort((a, b) => a.localeCompare(b, 'ja'));
+    .filter((l) => !q || l.includes(q) || showLabel(l).includes(q) || l === TED.line)
+    .sort((a, b) => showLabel(a).localeCompare(showLabel(b), 'ja'));
   if (!TED.line && labels.length) TED.line = labels[0];
   $('tedLine').innerHTML = labels.map((l) =>
-    `<option value="${esc(l)}"${l === TED.line ? ' selected' : ''}>${TYPES[l] && TYPES[l].order && TYPES[l].order.length ? '★ ' : ''}${esc(l)}</option>`).join('');
+    `<option value="${esc(l)}"${l === TED.line ? ' selected' : ''}>${TYPES[l] && TYPES[l].order && TYPES[l].order.length ? '★ ' : ''}${esc(showLabel(l))}</option>`).join('');
 }
 
 function tedRender() {
@@ -1455,7 +1502,7 @@ $('tedDel').onclick = () => {
 $('tedAll').onclick = () => { const D = tedData(TED.line); D.types[TED.sel] = lineStations(TED.line); D.dirty = true; tedRender(); };
 $('tedNone').onclick = () => { const D = tedData(TED.line); D.types[TED.sel] = []; D.dirty = true; tedRender(); };
 $('tedReset').onclick = () => {
-  if (!confirm(`${TED.line} の種別をこのブラウザで編集する前の状態（初期値${BUILTIN_TYPES[TED.line] ? '' : ': 種別なし'}）に戻しますか？`)) return;
+  if (!confirm(`${showLabel(TED.line)} の種別をこのブラウザで編集する前の状態（初期値${BUILTIN_TYPES[TED.line] ? '' : ': 種別なし'}）に戻しますか？`)) return;
   delete USER_TYPES[TED.line]; delete TED.work[TED.line];
   saveUserTypes(); tedLineOptions(); tedRender();
 };
