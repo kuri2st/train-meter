@@ -56,10 +56,35 @@ public class TrainLocationService extends Service {
         }
     };
 
+    /** GPS が最後に位置を返した時刻 (elapsedRealtime) */
+    private long lastGpsAt = 0;
+    /** GPS が黙っている (屋内・地下など) とみなすまでの時間。この間はネットワーク (Wi-Fi・基地局) の位置を使わない */
+    static final long GPS_QUIET_MS = 5000;
+
     // API 29 以前では onStatusChanged などが抽象メソッドなので全部実装する
     private final LocationListener locationListener = new LocationListener() {
         @Override
         public void onLocationChanged(Location loc) {
+            lastGpsAt = android.os.SystemClock.elapsedRealtime();
+            Listener l = listener;
+            if (l != null) l.onLocation(loc);
+        }
+
+        @Override
+        public void onStatusChanged(String provider, int status, Bundle extras) {}
+
+        @Override
+        public void onProviderEnabled(String provider) {}
+
+        @Override
+        public void onProviderDisabled(String provider) {}
+    };
+
+    /** ネットワークの位置。GPS が取れていないときだけ JS へ渡す (GPS より粗く、混ぜると位置がぶれるため) */
+    private final LocationListener networkListener = new LocationListener() {
+        @Override
+        public void onLocationChanged(Location loc) {
+            if (android.os.SystemClock.elapsedRealtime() - lastGpsAt < GPS_QUIET_MS) return;
             Listener l = listener;
             if (l != null) l.onLocation(loc);
         }
@@ -106,6 +131,9 @@ public class TrainLocationService extends Service {
         ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), type);
         if (locationManager == null) {
             locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+            // GPS と、屋内などで GPS が取れないときのためのネットワーク (Wi-Fi・基地局)。
+            // どちらか一方でも使えれば続ける (端末によってはネットワークの位置が無い)
+            boolean any = false;
             try {
                 locationManager.requestLocationUpdates(
                     LocationManager.GPS_PROVIDER,
@@ -114,7 +142,23 @@ public class TrainLocationService extends Service {
                     locationListener,
                     Looper.getMainLooper()
                 );
+                any = true;
             } catch (SecurityException | IllegalArgumentException e) {
+                // GPS が無い・「正確な位置情報」が許可されていない
+            }
+            try {
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER,
+                    INTERVAL_MS,
+                    0f,
+                    networkListener,
+                    Looper.getMainLooper()
+                );
+                any = true;
+            } catch (SecurityException | IllegalArgumentException e) {
+                // ネットワークの位置が無い端末
+            }
+            if (!any) {
                 stopSelf();
                 return START_NOT_STICKY;
             }
@@ -127,7 +171,10 @@ public class TrainLocationService extends Service {
     @Override
     public void onDestroy() {
         handler.removeCallbacks(heartbeat);
-        if (locationManager != null) locationManager.removeUpdates(locationListener);
+        if (locationManager != null) {
+            locationManager.removeUpdates(locationListener);
+            locationManager.removeUpdates(networkListener);
+        }
         locationManager = null;
         instance = null;
         super.onDestroy();

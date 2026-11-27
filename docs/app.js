@@ -160,7 +160,7 @@ function routeLines(name) {
 
 /** 路線名の表示: 運転系統が決まっていれば系統名を大きく、正式名を小さく */
 function lineDisplay(P) {
-  if (!P) return { main: S.running ? '線路の近くにいません' : '路線未判定', sub: '' };
+  if (!P) return { main: !S.running ? '路線未判定' : !S.lastFixAt ? '測位待ち…' : '線路の近くにいません', sub: '' };
   const r = currentRoute();
   return r ? { main: r, sub: lineShow(P.line) } : { main: lineShow(P.line), sub: '' };
 }
@@ -242,6 +242,7 @@ function onFix(fix) {
   const t = now();
   const { lat, lon, accuracy } = fix;
   S.acc = accuracy;
+  S.lastSeenAt = t;   // 捨てる測位も含めて、位置が届いた時刻
   if (accuracy > ACC_LIMIT) { logFix(t, fix, 'rejected'); return; }   // 精度が悪い (トンネル内の基地局測位など)
 
   // 速度: GPS の値を優先、無ければ前回位置との差
@@ -790,7 +791,9 @@ function render() {
   $('speed').textContent = S.running && (S.lastFixAt || S.est) ? Math.round(S.speed * 3.6) : '--';
   let status;
   if (!S.running) status = '停止中';
-  else if (!S.lastFixAt) status = '測位待ち…';
+  else if (!S.lastFixAt) status = S.lastSeenAt
+    ? `測位待ち… 届いた位置の精度が ±${Math.round(S.acc)} m で粗すぎる（±${ACC_LIMIT} m 以内を待っています）`
+    : '測位待ち… 位置がまだ届きません（屋内では取れないことがあります）';
   else if (S.est) status = `GPS 途切れ ${Math.round((t - S.lastFixAt) / 1000)} 秒 — 直前の速度で推定中`;
   else status = `GPS 精度 ±${Math.round(S.acc)} m` + (SIM ? `（模擬走行 ×${SIM_X}）` : '');
   $('status').textContent = status;
@@ -1103,13 +1106,14 @@ document.addEventListener('visibilitychange', () => {
 
 let nativeSubs = [];
 async function startNative() {
-  const sub = (ev, fn) => TrainLocation.addListener(ev, fn).then((h) => nativeSubs.push(h));
-  await sub('location', (l) => onFix({
-    lat: l.lat, lon: l.lon, accuracy: l.accuracy, speed: l.speed, heading: l.heading,
-  }));
-  // 裏ではタイマーが間引かれるので、サービスからの 1 秒ごとの合図で推定と通知を進める
-  await sub('tick', () => { tick(); updateNotification(now()); });
+  // addListener は Capacitor の版や呼び方によって、Promise を返すときと登録結果をそのまま返すときがある
+  const sub = (ev, fn) => Promise.resolve(TrainLocation.addListener(ev, fn)).then((h) => nativeSubs.push(h));
   try {
+    await sub('location', (l) => onFix({
+      lat: l.lat, lon: l.lon, accuracy: l.accuracy, speed: l.speed, heading: l.heading,
+    }));
+    // 裏ではタイマーが間引かれるので、サービスからの 1 秒ごとの合図で推定と通知を進める
+    await sub('tick', () => { tick(); updateNotification(now()); });
     await TrainLocation.start();
   } catch (e) {
     stop();
@@ -1119,6 +1123,7 @@ async function startNative() {
 
 function start() {
   S.running = true;
+  S.lastFixAt = 0; S.lastSeenAt = 0;   // 前回の測位を引きずらず「測位待ち」から始める
   $('startBtn').textContent = '停止';
   logStart();
   if (SIM) { requestWakeLock(); startSim(SIM); return; }
