@@ -55,6 +55,7 @@ const BG_GAP_MS = 10000;                // ブラウザでこれ以上バック�
 
 // ------------------------------------------------------------ データ
 let LINES = [], PATHS = [];
+let TYPES = {};   // data/types.json: 路線名 → {order, short, types: {種別: "all" | [停車駅]}}
 const GRID = new Map();
 const cellKey = (ix, iy) => ix * 100000 + iy;
 
@@ -64,6 +65,10 @@ async function loadData() {
   const js = await res.json();
   LINES = js.lines;
   $('attrib').textContent = '出典: ' + js.attribution;
+  try {   // 種別と停車駅 (無くても動く)
+    const tr = await fetch('data/types.json');
+    if (tr.ok) TYPES = await tr.json();
+  } catch (e) { console.warn('types.json', e); }
   const sc = js.scale;
   PATHS = js.paths.map((p, pi) => {
     const n = p.c.length / 2;
@@ -151,6 +156,10 @@ const S = {
   estDecel: 0,                 // 推定中に続ける減速度 [m/s^2]
   slowSince: 0,                // 停止し始めた時刻
   stopSt: null,                // 停車中の駅 {pi, s, n}
+  typeLine: null,              // 種別を判定している路線 (line index)
+  typeSel: null,               // 手動で選んだ種別 (null = 自動)
+  typeCands: null,             // 自動判定: まだ可能性のある種別の配列
+  passCheck: null,             // 駅を通過したか調べるための直前の位置 {pi, s}
   afterGap: false,             // バックグラウンドから戻った直後 (次の測位で位置を取り直す)
   hiddenAt: 0,
   acc: null,
@@ -269,6 +278,7 @@ function onFix(fix) {
     }
     S.pi = chosen.pi; S.s = s; S.dir = dir;
     S.lastMatchAt = t;
+    checkPassing(P, v);
     S.afterGap = false;
   } else if (S.lastMatchAt && t - S.lastMatchAt > 30000) {
     S.pi = -1; S.dir = 0; S.alts = [];   // 線路から離れた
@@ -329,7 +339,73 @@ function updateStop(t) {
     const d = Math.abs(ringDiff(P, st.s, S.s));
     if (g <= 0 && d < bd) { best = st; bd = d; }
   }
-  if (best) S.stopSt = { pi: S.pi, s: best.s, a: best.a, b: best.b, n: best.n };
+  if (best) {
+    S.stopSt = { pi: S.pi, s: best.s, a: best.a, b: best.b, n: best.n };
+    typeEvidence(best.n, true);
+  }
+}
+
+// ------------------------------------------------------------ 種別 (停車駅のパターン)
+/** 今の路線の種別データ (無ければ null) */
+function lineTypes() {
+  const P = PATHS[S.pi];
+  if (!P) return null;
+  const T = TYPES[lineLabel(P.line)];
+  if (!T) return null;
+  if (S.typeLine !== P.line) {   // 路線が変わったら判定をやり直す
+    S.typeLine = P.line; S.typeSel = null; S.typeCands = [...T.order];
+  }
+  return T;
+}
+const typeStops = (T, ty, name) => T.types[ty] === 'all' || T.types[ty].includes(name);
+const typeShort = (T, ty) => (T.short && T.short[ty]) || ty;
+
+/** 表示に使う種別: 手動で選んだもの、自動で 1 つに絞れたもの、どちらでもなければ null */
+function currentType(T) {
+  if (!T) return null;
+  if (S.typeSel) return S.typeSel;
+  return S.typeCands.length === 1 ? S.typeCands[0] : null;
+}
+
+/** その駅に止まるか (種別が決まっていなければ、候補のどれかが止まれば止まる扱い) */
+function stopsAt(name) {
+  const T = lineTypes();
+  if (!T) return true;
+  const ty = currentType(T);
+  if (ty) return typeStops(T, ty, name);
+  return S.typeCands.some((c) => typeStops(T, c, name));
+}
+
+/** 駅に止まった (stopped=true) / 通過した (false) ことから種別の候補を絞る */
+function typeEvidence(name, stopped) {
+  const T = lineTypes();
+  if (!T || !S.typeCands) return;
+  if (!Object.values(T.types).some((v) => v === 'all' || v.includes(name)) && !stopped) return;
+  const next = S.typeCands.filter((c) => typeStops(T, c, name) === stopped);
+  // どれにも当てはまらない (臨時停車・データの誤りなど) ときは候補を全部に戻す
+  S.typeCands = next.length ? next : [...T.order];
+}
+
+/** 駅の範囲 (ホーム ± 50 m。範囲の無いデータでは中心 ± 170 m) を、一度も 30 km/h 未満に
+ *  ならずに抜けたら通過とみなす。止まる列車も先頭車ならホームの中心は速いまま過ぎるので、範囲全体で見る */
+const PASS_V = 8;
+function checkPassing(P, v) {
+  if (S.dir === 0) { S.passCheck = null; return; }
+  const inside = P.st.find((st) => {
+    const lo = st.b - st.a > 20 ? st.a - 50 : st.s - 170, hi = st.b - st.a > 20 ? st.b + 50 : st.s + 170;
+    return S.s >= lo && S.s <= hi;
+  });
+  const pc = S.passCheck;
+  if (pc && (pc.pi !== S.pi || pc.n !== (inside && inside.n))) {
+    // 範囲を出た: 進行方向の先へ抜け、ずっと速く、推定も挟まず、そこで停車もしていなければ通過
+    const ahead = (S.s - pc.s) * S.dir > 0;
+    if (pc.pi === S.pi && ahead && pc.minV > PASS_V && !pc.est && !(S.stopSt && S.stopSt.n === pc.n)) typeEvidence(pc.n, false);
+    S.passCheck = null;
+  }
+  if (inside) {
+    if (!S.passCheck) S.passCheck = { pi: S.pi, n: inside.n, s: inside.s, minV: v, est: false };
+    else S.passCheck.minV = Math.min(S.passCheck.minV, v);
+  }
 }
 
 /** 現在位置が駅とみなす範囲からどれだけ外れているか [m] (0 以下なら範囲内)
@@ -363,6 +439,7 @@ function tick() {
   if (!NATIVE && document.hidden) return;   // ブラウザは裏で位置が来ないので推定もしない
   if (S.lastFixAt && t - S.lastFixAt > GPS_LOST_MS) {
     if (!S.est) S.estDecel = recentDecel();
+    if (S.passCheck) S.passCheck.est = true;
     S.est = true;
     if (S.estDecel) S.speed = Math.max(0, S.speed - S.estDecel * dt);
     if (S.pi >= 0 && S.dir !== 0) {
@@ -391,13 +468,13 @@ function stationsAhead(n) {
   const stop = S.stopSt && S.stopSt.pi === S.pi ? S.stopSt.s : null;
   for (const st of list) {
     const d = (st.s - S.s) * S.dir;
-    if (d > 0 && st.s !== stop) out.push({ n: st.n, dist: d });
+    if (d > 0 && st.s !== stop && stopsAt(st.n)) out.push({ n: st.n, dist: d });
     if (out.length >= n) return out;
   }
   if (P.loop) {   // 環状線は一周して続ける
     for (const st of list) {
       const d = (st.s - S.s) * S.dir + P.len;
-      if (d > 0 && st.s !== stop && out.length < n) out.push({ n: st.n, dist: d });
+      if (d > 0 && st.s !== stop && stopsAt(st.n) && out.length < n) out.push({ n: st.n, dist: d });
     }
   }
   return out;
@@ -481,6 +558,7 @@ function render() {
   const P = PATHS[S.pi];
   $('lineName').textContent = P ? lineLabel(P.line) : (S.running ? '線路の近くにいません' : '路線未判定');
   renderAlts(P);
+  renderTypes();
 
   // 次駅
   const ahead = stationsAhead(4);
@@ -546,6 +624,31 @@ function updateNotification(t) {
   if (key === lastNotif.key) return;
   lastNotif = { t, key };
   TrainLocation.setNotification({ title, text }).catch(() => {});
+}
+
+/** 種別の選択ボタン。「自動」は判定中の候補を表示 */
+function renderTypes() {
+  const box = $('typeChips');
+  const T = lineTypes();
+  const want = T ? `${S.typeLine}|${S.typeSel}|${S.typeCands.join(',')}` : '';
+  if (box.dataset.k === want) return;
+  box.dataset.k = want;
+  box.innerHTML = '';
+  if (!T) return;
+  const auto = document.createElement('button');
+  const guess = S.typeCands.length === 1 ? typeShort(T, S.typeCands[0])
+    : S.typeCands.length < T.order.length ? S.typeCands.map((c) => typeShort(T, c)).join('/') + '?' : '判定中';
+  auto.textContent = `自動: ${guess}`;
+  if (!S.typeSel) auto.classList.add('on');
+  auto.onclick = () => { S.typeSel = null; box.dataset.k = ''; };
+  box.appendChild(auto);
+  for (const ty of T.order) {
+    const b = document.createElement('button');
+    b.textContent = typeShort(T, ty);
+    if (S.typeSel === ty) b.classList.add('on');
+    b.onclick = () => { S.typeSel = ty; box.dataset.k = ''; };
+    box.appendChild(b);
+  }
 }
 
 function renderAlts(P) {
@@ -669,9 +772,13 @@ function drawStrip(ahead) {
   const sts = P.st.filter((st) => inView(st.s)).sort((a, b) => X(a.s) - X(b.s));
   for (const st of sts) {
     const x = X(st.s);
-    ctx.fillStyle = '#e8edf2'; ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
+    const stop = stopsAt(st.n);
+    ctx.beginPath(); ctx.arc(x, y, stop ? 5 : 3.5, 0, Math.PI * 2);
+    if (stop) { ctx.fillStyle = '#e8edf2'; ctx.fill(); }
+    else { ctx.fillStyle = '#101418'; ctx.fill(); ctx.strokeStyle = '#8b97a3'; ctx.lineWidth = 1.5; ctx.stroke(); }
     row = x - lastX < 70 ? 1 - row : 0;
     lastX = x;
+    ctx.fillStyle = stop ? '#e8edf2' : '#6b7680';   // 通過駅は暗く
     ctx.fillText(st.n, x, row ? y + 36 : y + 22);
   }
   // 現在位置
@@ -747,7 +854,7 @@ function stop() {
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 }
 
-/** 模擬走行: ?sim=路線名の一部 [&x=早回し倍率] [&v=最高速度km/h]
+/** 模擬走行: ?sim=路線名の一部 [&x=早回し倍率] [&v=最高速度km/h] [&n=位置の誤差m] [&t=種別]
  *  各駅に停車し、トンネル内では GPS を出さない (推定の動作確認用) */
 function startSim(q) {
   let best = null;
@@ -759,10 +866,13 @@ function startSim(q) {
   const P = PATHS[best];
   const vmax = (Number(params.get('v')) || (lineLabel(P.line).includes('新幹線') ? 270 : 100)) / 3.6;
   const SIM_NOISE = Number(params.get('n')) || 4;   // 位置の誤差 [m]
-  const sim = { s: P.st[0].s, v: 0, dwell: 15, idx: 1 };
+  // t=種別名 で、その種別の停車駅だけに止まる (種別の自動判定の確認用)
+  const T = TYPES[lineLabel(P.line)], ty = params.get('t');
+  const stops = T && T.types[ty] ? P.st.filter((st) => typeStops(T, ty, st.n)) : P.st;
+  const sim = { s: stops[0].s, v: 0, dwell: 15, idx: 1 };
   const dt = 1;   // 模擬時間で 1 秒ごと
   simTimer = setInterval(() => {
-    const target = P.st[sim.idx];
+    const target = stops[sim.idx];
     if (!target) { stop(); return; }
     if (sim.dwell > 0) { sim.dwell -= dt; }
     else {
