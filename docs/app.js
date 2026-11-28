@@ -26,6 +26,13 @@ const STOP_V = 1.5;                     // これ未満を停止とみなす [m/
 const STOP_HOLD_MS = 3000;              // この時間停止が続いたら駅に着いたとみなす
 const STOP_MARGIN = 40;                 // 駅 (ホーム) の範囲からこの距離までは駅とみなす [m] (+ GPS 精度、最大 +100)
 const STOP_RADIUS = 200;                // 範囲の無い古いデータ用: 駅の中心からの距離 [m] (+ GPS 精度)
+const LINE_KEEP_M = 50;                 // 今の路線がこの距離 (か GPS 精度の 2.5 倍) 以内にある間は、並走する別の路線へ乗り換えない [m]
+const STOP_OFF_MAX = 150;               // 止まった位置の駅の中心からのずれとして使う上限 [m]
+const STOPLINE_HOLD_MS = 10000;         // この時間止まった所を「最後に止まった所」とし、そこに駅のある路線を調べる
+const STOPLINE_R = 250;                 // その路線の駅 (ホーム) からこの距離以内なら、駅があるとみなす [m]
+const STOPLINE_COST = 3;                // 最後に止まった所に駅の無い路線を選びにくくする量
+const DIR_HEADING_V = 5;                // 進行方向が決まった後は、これより速いときだけ GPS の向きで逆にする [m/s]
+const DIR_FLIP_N = 3;                   // GPS の向きが今の進行方向と逆の測位がこの回数続いたら逆にする
 const HIST_MAX_SEC = 1800;
 
 const DEFAULTS = { logOn: false, histSec: 180, tnInside: true, tnExit: true, tnNext: true, tnSection: true };
@@ -220,6 +227,10 @@ const S = {
   estDecel: 0,                 // 推定中に続ける減速度 [m/s^2]
   slowSince: 0,                // 停止し始めた時刻
   stopSt: null,                // 停車中の駅 {pi, s, n}
+  stopOffs: [],                // この乗車で止まった位置の、駅の中心からのずれ [m] (進行方向が正。乗っている車両の位置で決まる)
+  stopLines: null,             // 最後に止まった所に駅のある路線 (line index の Set)。駅の無い所で止まったら空
+  stopLinesAt: 0,              // stopLines を調べた停止 (slowSince)
+  dirFlipN: 0,                 // GPS の向きが進行方向と逆だった測位が続いた回数
   typeLine: null,              // 種別を判定している路線 (line index)
   typeSel: null,               // 手動で選んだ種別 (null = 自動)
   typeCands: null,             // 自動判定: まだ可能性のある種別の配列
@@ -296,11 +307,28 @@ function onFix(fix) {
         cost += (ad / 25) ** 2;
       }
       if (PATHS[c.pi].len < 2000) cost += 1.5;   // 駅構内の引込線などの短いパスは選びにくく
+      if (lacksStopStation(c.line)) cost += STOPLINE_COST;
       if (S.pinnedLine != null && c.line === S.pinnedLine) cost -= 4;
       c.cost = cost;
     }
     cands.sort((a, b) => a.cost - b.cost);
     chosen = cands[0];
+    // 並走する別の路線へは、今の路線が近くに無くなるまで乗り換えない。線路の中心線どうしは 10〜30 m しか
+    // 離れていないことが多く、GPS の誤差で近い方が入れ替わる (横浜で相鉄線・みなとみらい線、新橋で新幹線になっていた)。
+    // 停車中は乗り換えない。手で選んだ路線と、運転系統が通る路線へは今までどおり。
+    // 最後に止まった所に今の路線の駅が無く、乗り換え先の路線にはあるときも乗り換える (新橋で乗ったのに新幹線になっていた)
+    if (S.pi >= 0 && chosen.line !== PATHS[S.pi].line && chosen.line !== S.pinnedLine &&
+        !(lacksStopStation(PATHS[S.pi].line) && !lacksStopStation(chosen.line))) {
+      const rl = S.routeNow ? routeLines(S.routeNow) : null;
+      if (!(rl && rl.has(chosen.line))) {
+        const cur = PATHS[S.pi].line;
+        const keepD = Math.max(LINE_KEEP_M, accuracy * 2.5, v < STOP_V ? radius : 0);
+        // 今の路線は探す範囲 (radius) の外にあることもあるので、keepD まで広げて探す
+        const stay = cands.find((c) => c.line === cur && c.d <= keepD) ||
+          candidates(lat, lon, keepD).filter((c) => c.line === cur).sort((a, b) => a.d - b.d)[0];
+        if (stay) { stay.cost = stay.cost ?? chosen.cost; chosen = stay; }
+      }
+    }
 
     // 区別できない路線 (候補が近く、評価も僅差) を手動選択用に並べる
     const alts = [];
@@ -343,14 +371,22 @@ function onFix(fix) {
         if (lk && lk.qi === chosen.pi) dir = lk.entry === 0 ? 1 : -1;
       }
     }
-    // 進行方向: 走行中なら GPS の向き、向きが無ければ一定距離動いた向き。停止中は変えない
-    if (v <= 1) S.anchorS = s;
-    else if (v > 2 && fix.heading != null && !Number.isNaN(fix.heading)) {
-      dir = Math.cos((fix.heading - chosen.bearing) * Math.PI / 180) >= 0 ? 1 : -1;
+    // 進行方向: 走行中なら GPS の向き、向きが無ければ一定距離動いた向き。停止中は変えない。
+    // 動き出しや止まる直前の GPS の向きは当てにならない (品川の発車で 185° のところ 21° だった) ので、
+    // 方向が決まった後は速くなるまで向きでは逆にしない。速くても高架下などで向きだけ外れることがある
+    // (浜松町で 220° のところ 332°・4°) ので、逆向きが DIR_FLIP_N 回続いたときだけ逆にする
+    if (v <= 1) { S.anchorS = s; S.dirFlipN = 0; }
+    else if (v > (dir === 0 ? 2 : DIR_HEADING_V) && fix.heading != null && !Number.isNaN(fix.heading)) {
+      const hd = Math.cos((fix.heading - chosen.bearing) * Math.PI / 180) >= 0 ? 1 : -1;
+      if (dir === 0 || hd === dir) S.dirFlipN = 0;
+      else if (++S.dirFlipN >= DIR_FLIP_N) S.dirFlipN = 0;
+      if (S.dirFlipN === 0) dir = hd;
       S.anchorS = s;
     } else {
+      S.dirFlipN = 0;
+      // 逆にするのは、GPS 精度の 2 倍より大きく動いたときだけ (川崎のホームで精度 100 m の位置が 41 m ずれて逆になった)
       const ds = ringDiff(P, s, S.anchorS);
-      if (Math.abs(ds) > 25) { dir = Math.sign(ds); S.anchorS = s; }
+      if (Math.abs(ds) > (dir === 0 || Math.sign(ds) === dir ? 25 : Math.max(25, 2 * accuracy))) { dir = Math.sign(ds); S.anchorS = s; }
     }
     S.pi = chosen.pi; S.s = s; S.dir = dir;
     S.lastMatchAt = t;
@@ -405,8 +441,13 @@ function wrapS(P, s) {
 
 /** 駅の近くで一定時間止まったら、その駅に着いたとみなす (次駅の表示をその先の駅にする) */
 function updateStop(t) {
+  // 一定時間止まったら、そこに駅のある路線を覚えておく (路線を見分けるのに使う。線路から離れていても調べる)
+  if (S.speed < STOP_V && S.slowSince && t - S.slowSince >= STOPLINE_HOLD_MS && S.stopLinesAt !== S.slowSince && S.lastFix) {
+    S.stopLinesAt = S.slowSince;
+    S.stopLines = stationLinesAt(S.lastFix.lat, S.lastFix.lon);
+  }
   const P = PATHS[S.pi];
-  if (!P) { S.stopSt = null; return; }
+  if (!P) { S.stopSt = null; if (S.speed >= STOP_V) S.slowSince = 0; else if (!S.slowSince) S.slowSince = t; return; }
   const acc = Math.min(S.acc || 0, 100);
   if (S.stopSt && (S.stopSt.pi !== S.pi || stationGap(P, S.stopSt, acc) > 200)) S.stopSt = null;
   if (S.speed >= STOP_V) { S.slowSince = 0; return; }
@@ -419,10 +460,36 @@ function updateStop(t) {
     if (g <= 0 && d < bd) { best = st; bd = d; }
   }
   if (best) {
-    if (!S.stopSt || S.stopSt.n !== best.n) logEvent('arrive', best.n, `中心から ${Math.round((S.s - best.s) * (S.dir || 1))} m`);
+    if (!S.stopSt || S.stopSt.n !== best.n) {
+      const off = (S.s - best.s) * (S.dir || 1);
+      logEvent('arrive', best.n, `中心から ${Math.round(off)} m`);
+      if (S.dir !== 0 && Math.abs(off) <= STOP_OFF_MAX) S.stopOffs.push(off);
+    }
     S.stopSt = { pi: S.pi, s: best.s, a: best.a, b: best.b, n: best.n };
     typeEvidence(best.n, true);
   }
+}
+
+/** その地点の近くに駅 (ホーム ± STOPLINE_R) のある路線 */
+function stationLinesAt(lat, lon) {
+  const out = new Set();
+  for (const c of candidates(lat, lon, STOPLINE_R)) {
+    const P = PATHS[c.pi];
+    const has = P.st.some((st) => {
+      const d = ringDiff(P, c.s, st.s);
+      const wide = st.b - st.a > 20;
+      return d >= (wide ? st.a - st.s : 0) - STOPLINE_R && d <= (wide ? st.b - st.s : 0) + STOPLINE_R;
+    });
+    if (has) out.add(c.line);
+  }
+  return out;
+}
+
+/** 最後に止まった所が駅で、その路線の駅がそこに無い (手で選んだ路線・運転系統の通る路線は除く) */
+function lacksStopStation(line) {
+  if (!S.stopLines || !S.stopLines.size || S.stopLines.has(line) || line === S.pinnedLine) return false;
+  const rl = S.routeNow ? routeLines(S.routeNow) : null;
+  return !(rl && rl.has(line));
 }
 
 // ------------------------------------------------------------ 種別 (停車駅のパターン)
@@ -621,7 +688,132 @@ function stationsAheadAll(n) {
     }
     off += Q.len; cur = lk.qi; exitEnd = 1 - lk.entry;
   }
+  if (stops >= n) return out;
+  // 止まる駅が足りなければ、別のパスの途中で分かれる・合流する線路もたどって探し直す
+  // (鶴見付近: 東海道線の本線のパスが品鶴線のパスの途中で切れ、川崎へ向かうパスがその途中から分かれている)。
+  // 分かれ方の判断で今まで出ていた駅が変わらないよう、最初に止まる駅が同じで止まる駅が増えるか、
+  // 最初に止まる駅がより近いときだけ使う (端どうしのつなぎで遠回りして、ずっと先の駅を出していた)
+  const nm2 = new Set();
+  if (here != null) nm2.add(S.stopSt.n);
+  const alt = [];
+  let altStops = 0;
+  for (const a of routeAhead(S.pi, S.s, S.dir, 0, 0, new Set([S.pi]), nm2, n)) {
+    if (altStops >= n) break;
+    alt.push({ n: a.n, dist: a.dist, stop: a.stop });
+    if (a.stop) altStops++;
+  }
+  const f0 = out.find((a) => a.stop), f1 = alt.find((a) => a.stop);
+  if (!f1) return out;
+  if (!f0 || f1.dist < f0.dist - 1) return alt;
+  return altStops > stops && f1.n === f0.n ? alt : out;
+}
+
+/** パス pi を s0 から dir の向きに進んだときの駅 [{n, dist, stop, d}] (dist は off から数える)。
+ *  パスを出たら続くパスへ移る。行き先が複数あるときは止まる駅が近い方、同じなら止まる駅が多い方 */
+const ROUTE_DEPTH = 3;
+function routeAhead(pi, s0, dir, off, depth, seen, names, need) {
+  const P = PATHS[pi];
+  const own = [], nm = new Set(names);
+  for (const st of dir > 0 ? P.st : [...P.st].reverse()) {
+    const d = (st.s - s0) * dir;
+    // 今いるパスは前方の駅だけ。乗り移った先は、乗り移った点にある駅も含める
+    if ((depth === 0 ? d <= 0 : d < -1) || nm.has(st.n)) continue;
+    nm.add(st.n);
+    own.push({ n: st.n, dist: off + Math.max(0, d), stop: stopsAt(st.n), d });
+  }
+  const count = (l) => l.reduce((k, a) => k + (a.stop ? 1 : 0), 0);
+  if (count(own) >= need || depth >= ROUTE_DEPTH) return own;
+  const firstStop = (l) => { const a = l.find((x) => x.stop); return a ? a.dist : Infinity; };
+  // 最初に止まる駅が別の駅なら近い方。同じ駅 (スイッチバックの早岐・藤沢で、そのまま進む線路と折り返す線路) なら
+  // 止まる駅が多い方 (そのまま進む方は駅の先で行き止まりになる)
+  const better = (a, b) => {
+    const sa = a.find((x) => x.stop), sb = b.find((x) => x.stop);
+    if (!sa !== !sb) return !!sa;
+    if (sa && sa.n !== sb.n && Math.abs(sa.dist - sb.dist) >= 1) return sa.dist < sb.dist;
+    if (count(a) !== count(b)) return count(a) > count(b);
+    if (sa) return false;   // 同じ駅で数も同じなら先に見た方 (向きを確かめたつながりを先に見る)
+    return a.length > b.length;
+  };
+  const via = (o) => {
+    const head = own.filter((a) => a.d <= o.dP + 1);
+    const hn = new Set([...names, ...head.map((a) => a.n)]);
+    return head.concat(routeAhead(o.qi, o.sQ, o.dQ, off + o.dP + o.gap, depth + 1,
+      new Set([...seen, o.qi]), hn, need - count(head)));
+  };
+  const tr = pathTransitions(pi, s0, dir).filter((o) => !seen.has(o.qi));
+  let best = own;
+  for (const o of tr) if (!o.mid) { const l = via(o); if (better(l, best)) best = l; }
+  // 途中で分かれるパスは、分かれた方が止まる駅がずっと近い (そのまま進む方の 6 割未満) ときだけ選ぶ
+  // (鶴見付近: 東海道線の本線のパスが品鶴線のパスの途中で切れ、川崎へ向かうパスがその途中から分かれている。
+  //  そのまま品鶴線を進むと 品川 まで止まる駅が無い)。どちらにも進めるので、近さに差が無ければそのまま進む方
+  const straight = firstStop(best);
+  for (const o of tr) {
+    if (!o.mid) continue;
+    const l = via(o), f = firstStop(l);
+    if (f < straight * 0.6 && f < firstStop(best)) best = l;
+  }
+  return best;
+}
+
+/** パス pi を s0 から dir の向きに進む先で乗り移れる同じ路線のパス [{qi, sQ, dQ, dP, gap, mid}]。
+ *  dP: 乗り移る点までの距離、sQ・dQ: 乗り移った先の位置と向き、mid: 今のパスの途中で分かれる */
+const TR_D = 40, TR_ALONG = 100;
+function pathTransitions(pi, s0, dir) {
+  const P = PATHS[pi], res = [];
+  for (const t of rawTransitions(pi)) {
+    const dP = (t.sP - s0) * dir;
+    if (dP < -1) continue;   // 後ろ
+    // 進む向きと、乗り移った先の向きが 60 度以内か
+    const tx = t.pT.x * dir, ty = t.pT.y * dir;
+    const dot = tx * t.qT.x + ty * t.qT.y;
+    let dQ = t.dQ;
+    if (dQ === 0) { if (Math.abs(dot) < 0.5) continue; dQ = Math.sign(dot); }
+    else if (dot * dQ < 0.5) continue;
+    res.push({ qi: t.qi, sQ: t.sQ, dQ, dP: Math.max(0, dP), gap: t.gap, mid: t.mid });
+  }
+  // 端どうしが離れているもの (スイッチバックなど。向きは見ない)
+  const lk = pathLink(pi, dir > 0 ? 1 : 0);
+  if (lk) res.push({ qi: lk.qi, sQ: lk.entry ? PATHS[lk.qi].len : 0, dQ: lk.entry ? -1 : 1,
+    dP: dir > 0 ? P.len - s0 : s0, gap: lk.gap, mid: false });
+  return res;
+}
+
+/** パス pi と同じ路線のパスが接する点 (向きを問わない)。
+ *  Q の端が pi の途中にある (pi から分かれる)・pi の端が Q の途中にある (pi が Q に合流する) の 2 通り */
+const trCache = new Map();
+function rawTransitions(pi) {
+  if (trCache.has(pi)) return trCache.get(pi);
+  const P = PATHS[pi], out = [];
+  PATHS.forEach((Q, qi) => {
+    if (qi === pi || Q.line !== P.line || Q.loop || !Q.st.length) return;
+    for (const entry of [0, 1]) {
+      const sQ = entry ? Q.len : 0;
+      const pr = projectOnPath(P, pointAt(Q, sQ));
+      if (pr.d > TR_D) continue;
+      const probe = pointAt(Q, entry ? Math.max(0, Q.len - 1000) : Math.min(Q.len, 1000));
+      if (distToPath(P, probe) < TR_ALONG) continue;   // P に沿っている (並走する別の線路)
+      // P の端の近くなら端から乗り移るものとして扱う (端の手前の駅を落とさないため)
+      const atEnd = pr.s <= 50 ? 0 : pr.s >= P.len - 50 ? P.len : null;
+      out.push({ mid: atEnd == null, qi, sP: atEnd ?? pr.s, sQ, dQ: entry ? -1 : 1, gap: pr.d,
+        pT: tangent(P, pr.s), qT: tangent(Q, sQ) });
+    }
+    for (const end of [0, 1]) {
+      const sP = end ? P.len : 0;
+      const pr = projectOnPath(Q, pointAt(P, sP));
+      if (pr.d > TR_D) continue;
+      out.push({ mid: false, qi, sP, sQ: pr.s, dQ: 0, gap: pr.d, pT: tangent(P, sP), qT: tangent(Q, pr.s) });
+    }
+  });
+  trCache.set(pi, out);
   return out;
+}
+
+/** パス上の位置 s での向き (s が増える向きの単位ベクトル、東が x・北が y) */
+function tangent(P, s) {
+  const a = pointAt(P, Math.max(0, s - 30)), b = pointAt(P, Math.min(P.len, s + 30));
+  const x = (b.lon - a.lon) * R_LON * Math.cos(a.lat * Math.PI / 180), y = (b.lat - a.lat) * R_LAT;
+  const L = Math.hypot(x, y) || 1;
+  return { x: x / L, y: y / L };
 }
 
 /** 運転系統が今の路線を離れて別の路線へ続くとき、{dEnd: 離れる駅までの距離, endName, endPos, next: その先の [[路線, 駅名]]}。
@@ -676,14 +868,17 @@ function geoDist(a, b) {
   return Math.hypot((a.lon - b.lon) * R_LON * Math.cos(a.lat * Math.PI / 180), (a.lat - b.lat) * R_LAT);
 }
 /** 点からパスまでの最短距離 [m] */
-function distToPath(P, p) {
+function distToPath(P, p) { return projectOnPath(P, p).d; }
+/** 点をパスに投影する {d: 距離 [m], s: パス上の位置 [m]} */
+function projectOnPath(P, p) {
   const cl = Math.cos(p.lat * Math.PI / 180);
-  let best = Infinity;
+  let best = { d: Infinity, s: 0 };
   for (let k = 0; k < P.lon.length - 1; k++) {
     const ax = (P.lon[k] - p.lon) * R_LON * cl, ay = (P.lat[k] - p.lat) * R_LAT;
     const dx = (P.lon[k + 1] - P.lon[k]) * R_LON * cl, dy = (P.lat[k + 1] - P.lat[k]) * R_LAT, L2 = dx * dx + dy * dy;
     const t = L2 > 0 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / L2)) : 0;
-    best = Math.min(best, Math.hypot(ax + t * dx, ay + t * dy));
+    const d = Math.hypot(ax + t * dx, ay + t * dy);
+    if (d < best.d) best = { d, s: P.cd[k] + t * (P.cd[k + 1] - P.cd[k]) };
   }
   return best;
 }
@@ -720,12 +915,19 @@ function etaSec(D) {
  *  (減速が始まってから出し直すより、巡航中の予想の方が当たりやすいため) */
 const etaHold = { n: null, at: 0 };
 function nextEtaSec(nx, t) {
-  const e = etaSec(nx.dist);
+  const e = etaSec(Math.max(1, nx.dist + stopOffset()));
   if (isStopped()) { etaHold.n = null; return e; }
   const braking = S.est ? S.estDecel > 0 : accelNow() < -0.15;
   if (braking && etaHold.n === nx.n && etaHold.at > t) return (etaHold.at - t) / 1000;
   if (!braking && e != null) { etaHold.n = nx.n; etaHold.at = t + e * 1000; }
   return e;
+}
+
+/** この乗車で止まった位置の、駅の中心からのずれ [m] (2 駅以上止まったら中央値。乗っている車両が前寄りなら正)。
+ *  到着予想は駅の中心ではなくこの位置に止まるとして出す (平塚〜新橋で中心の 20〜80 m 先に止まり、予想が 5〜17 秒早かった) */
+function stopOffset() {
+  const a = S.stopOffs.slice(-7).sort((x, y) => x - y);
+  return a.length >= 2 ? a[Math.floor(a.length / 2)] : 0;
 }
 
 /** 直近 5 秒の加速度 [m/s^2] (測位の速度の回帰直線の傾き) */
@@ -908,7 +1110,7 @@ function renderTypes() {
     : S.typeCands.length < T.order.length ? `候補 ${S.typeCands.length}` : '判定中';
   auto.textContent = `自動: ${guess}`;
   if (!S.typeSel) auto.classList.add('on');
-  auto.onclick = () => { S.typeSel = null; box.dataset.k = ''; };
+  auto.onclick = () => { if (S.typeSel) logEvent('type', '', '自動に戻す'); S.typeSel = null; box.dataset.k = ''; };
   box.appendChild(auto);
   const pick = (ty) => { S.typeSel = ty; box.dataset.k = ''; logEvent('type', '', `手動で ${ty}`); };
   if (T.order.length > TYPE_BUTTONS_MAX) {
@@ -1124,6 +1326,8 @@ async function startNative() {
 function start() {
   S.running = true;
   S.lastFixAt = 0; S.lastSeenAt = 0;   // 前回の測位を引きずらず「測位待ち」から始める
+  S.stopOffs = [];                     // 止まる位置のずれは乗る車両で変わるので乗車ごと
+  S.stopLines = null; S.stopLinesAt = 0;
   $('startBtn').textContent = '停止';
   logStart();
   if (SIM) { requestWakeLock(); startSim(SIM); return; }
